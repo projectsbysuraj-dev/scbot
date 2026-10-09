@@ -1,0 +1,107 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scaleUp {
+  from {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-slide-up {
+  animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-scale-up {
+  animation: scaleUp 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.2s ease-out forwards;
+}
+
+/* Dark Mode Theme Overrides */
+.dark-mode .bg-white {
+  background-color: #151f32 !important;
+}
+
+.dark-mode .text-slate-900,
+.dark-mode .text-slate-800 {
+  color: #f8fafc !important;
+}
+
+.dark-mode .text-slate-700,
+.dark-mode .text-slate-600 {
+  color: #cbd5e1 !important;
+}
+
+.dark-mode .text-slate-500 {
+  color: #94a3b8 !important;
+}
+
+.dark-mode .border-slate-100,
+.dark-mode .border-slate-200,
+.dark-mode .border-slate-200\/80,
+.dark-mode .border-slate-200\/90,
+.dark-mode .border-white {
+  border-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+.dark-mode .bg-slate-50,
+.dark-mode .bg-slate-100 {
+  background-color: #1e293b !important;
+}
+
+.dark-mode .bg-orange-50 {
+  background-color: rgba(249, 115, 22, 0.15) !important;
+}
+
+.dark-mode .text-amber-950 {
+  color: #fef3c7 !important;
+}
+
+.dark-mode .text-amber-800,
+.dark-mode .text-amber-900 {
+  color: #fde68a !important;
+}
+

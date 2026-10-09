@@ -343,16 +343,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const handleDeleteSingleWithdrawal = (id: string) => {
     setConfirmDialog({
       isOpen: true,
-      title: 'Permanently Delete Record',
-      message: 'Kya aap is withdrawal request ko Firebase Database aur queue se PERMANENTLY DELETE karna chahte hain?\n\nYe record database se hamesha ke liye gayab ho jayega.',
-      confirmLabel: 'Delete Permanently 🗑️',
+      title: 'Permanently Delete Record (No Refund)',
+      message: 'Kya aap is withdrawal request ko Firebase Database aur queue se PERMANENTLY DELETE karna chahte hain?\n\n⚠️ Note: Delete karne par user ko koi refund NAHI jayega.',
+      confirmLabel: 'Delete Without Refund 🗑️',
       confirmColor: 'red',
       onConfirm: async () => {
         triggerHaptic('error');
         await deletePermanentWithdrawal(id);
         const updated = await refreshWithdrawalsFromRemote();
         setWithdrawals(updated);
-        showWithdrawalToast('🗑️ Withdrawal record permanently deleted from Firebase database.');
+        showWithdrawalToast('🗑️ Withdrawal record permanently deleted (No refund sent).');
         setConfirmDialog(null);
       },
     });

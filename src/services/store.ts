@@ -1233,9 +1233,18 @@ export async function requestWithdrawal(
     return { success: false, error: 'Withdrawal already submitted! Please wait a moment.' };
   }
 
-  // Deduct balance immediately
+  // Deduct balance immediately and commit to Firebase RTDB before creating withdrawal record
   u.balance = Number(Math.max(0, u.balance - numAmount).toFixed(2));
   saveSingleUser(u);
+  try {
+    await fetch(`${RTDB_BASE_URL}/users/${u.id}.json`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sanitizeForFirebase(u)),
+    });
+  } catch {
+    // Ignore network hiccup
+  }
 
   const withdrawalId = `w_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
 
@@ -1358,82 +1367,163 @@ export async function approveWithdrawal(withdrawalId: string): Promise<boolean> 
   return true;
 }
 
+const rejectingWithdrawalLocks = new Set<string>();
+
 export async function rejectWithdrawal(withdrawalId: string, reason = 'Verification failed / Invalid details'): Promise<boolean> {
+  const cleanWId = String(withdrawalId).trim();
+  if (!cleanWId || rejectingWithdrawalLocks.has(cleanWId)) return false;
+
   const list = getAllWithdrawals();
-  const item = list.find(w => w.id === withdrawalId);
-  if (!item || item.status !== 'pending') return false;
+  const item = list.find(w => w.id === cleanWId);
+  if (!item || item.status !== 'pending' || (item as any).refunded) return false;
 
-  item.status = 'rejected';
-  item.rejectReason = reason;
-  item.updatedAt = Date.now();
-  saveWithdrawals(list);
+  rejectingWithdrawalLocks.add(cleanWId);
 
-  const payload = {
-    status: 'rejected',
-    rejectReason: reason,
-    updatedAt: item.updatedAt,
-  };
-
-  // 1. Direct REST PATCH
   try {
-    await fetch(`${RTDB_BASE_URL}/withdrawals/${withdrawalId}.json`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-  } catch (e) {
-    console.warn('Direct HTTP PATCH error:', e);
-  }
-
-  // 2. Push update via Firebase SDK
-  if (rtdb) {
+    // Check remote withdrawal status first to prevent any duplicate refund across sessions/tabs
     try {
-      update(ref(rtdb, `withdrawals/${withdrawalId}`), payload).catch((e) => {
-        console.warn('Firebase rejectWithdrawal notice:', e);
+      const remWResp = await fetch(`${RTDB_BASE_URL}/withdrawals/${cleanWId}.json`, { cache: 'no-store' });
+      if (remWResp.ok) {
+        const remW = await remWResp.json();
+        if (remW && typeof remW === 'object') {
+          if (remW.status && remW.status !== 'pending') {
+            item.status = remW.status;
+            saveWithdrawals(list);
+            return false;
+          }
+          if (remW.refunded === true) {
+            item.status = 'rejected';
+            (item as any).refunded = true;
+            saveWithdrawals(list);
+            return false;
+          }
+        }
+      }
+    } catch {
+      // Proceed if offline
+    }
+
+    item.status = 'rejected';
+    item.rejectReason = reason;
+    item.updatedAt = Date.now();
+    (item as any).refunded = true;
+    saveWithdrawals(list);
+
+    const payload = {
+      status: 'rejected',
+      rejectReason: reason,
+      updatedAt: item.updatedAt,
+      refunded: true,
+    };
+
+    // 1. Direct REST PATCH
+    try {
+      await fetch(`${RTDB_BASE_URL}/withdrawals/${cleanWId}.json`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       });
     } catch (e) {
-      console.warn('Firebase SDK update exception caught:', e);
+      console.warn('Direct HTTP PATCH error:', e);
     }
-  }
 
-  // Refund money to user's balance
-  const users = getAllUsers();
-  const u = users.find(x => x.id === item.userId || x.telegramId === item.userId);
-  if (u) {
-    u.balance = Number((u.balance + item.amount).toFixed(2));
-    saveSingleUser(u);
-  }
-
-  // Update transaction
-  const allTxs = getAllTransactions();
-  const pendingTx = allTxs.find(t => t.userId === item.userId && t.type === 'withdrawal' && Math.abs(t.amount) === item.amount && t.status === 'pending');
-  if (pendingTx) {
-    pendingTx.status = 'rejected';
-    saveTransactions(allTxs);
+    // 2. Push update via Firebase SDK
     if (rtdb) {
-      update(ref(rtdb, `transactions/${pendingTx.id}`), { status: 'rejected' }).catch(() => {});
+      try {
+        update(ref(rtdb, `withdrawals/${cleanWId}`), payload).catch((e) => {
+          console.warn('Firebase rejectWithdrawal notice:', e);
+        });
+      } catch (e) {
+        console.warn('Firebase SDK update exception caught:', e);
+      }
     }
-    fetch(`${RTDB_BASE_URL}/transactions/${pendingTx.id}.json`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: 'rejected' }),
-    }).catch(() => {});
-  }
-  // Add refund transaction log
-  addTransaction({
-    userId: item.userId,
-    type: 'withdrawal_refund',
-    amount: item.amount,
-    description: `Refund for rejected withdrawal: ${reason}`,
-    status: 'completed',
-  });
 
-  notifySubscribers('withdrawal_rejected');
-  return true;
+    // 3. Refund strictly 1x the exact withdrawal amount using LIVE user balance from Firebase RTDB
+    // (Prevents stale admin localStorage balance from causing a double refund!)
+    const cleanUserId = String(item.userId).trim();
+    const refundAmount = Number(item.amount) || 0;
+
+    let remoteUser: UserProfile | null = null;
+    try {
+      const uResp = await fetch(`${RTDB_BASE_URL}/users/${cleanUserId}.json`, { cache: 'no-store' });
+      if (uResp.ok) {
+        const uData = await uResp.json();
+        if (uData && typeof uData === 'object' && (uData.id || uData.telegramId)) {
+          remoteUser = uData as UserProfile;
+        }
+      }
+    } catch {
+      // Fallback to local user if network fails
+    }
+
+    const users = getAllUsers();
+    const localUser = users.find(x => String(x.id).trim() === cleanUserId || String(x.telegramId).trim() === cleanUserId);
+    const currentLiveBalance =
+      remoteUser && typeof remoteUser.balance === 'number'
+        ? Number(remoteUser.balance)
+        : localUser
+        ? Number(localUser.balance) || 0
+        : 0;
+
+    const exactRefundedBalance = Number((currentLiveBalance + refundAmount).toFixed(2));
+
+    const updatedUser: UserProfile = {
+      ...(localUser || remoteUser || {
+        id: cleanUserId,
+        telegramId: cleanUserId,
+        name: item.userName || `User #${cleanUserId}`,
+        username: `user_${cleanUserId}`,
+        spins: 1,
+        friendsJoined: 0,
+        spinsEarned: 1,
+        createdAt: Date.now(),
+        isVerified: true,
+        deviceVerified: true,
+      }),
+      ...(remoteUser || {}),
+      id: cleanUserId,
+      balance: exactRefundedBalance,
+    };
+
+    saveSingleUser(updatedUser);
+
+    // Update transaction
+    const allTxs = getAllTransactions();
+    const pendingTx = allTxs.find(
+      t => String(t.userId).trim() === cleanUserId && t.type === 'withdrawal' && Math.abs(t.amount) === refundAmount && t.status === 'pending'
+    );
+    if (pendingTx) {
+      pendingTx.status = 'rejected';
+      saveTransactions(allTxs);
+      if (rtdb) {
+        update(ref(rtdb, `transactions/${pendingTx.id}`), { status: 'rejected' }).catch(() => {});
+      }
+      fetch(`${RTDB_BASE_URL}/transactions/${pendingTx.id}.json`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'rejected' }),
+      }).catch(() => {});
+    }
+
+    // Add refund transaction log
+    addTransaction({
+      userId: cleanUserId,
+      type: 'withdrawal_refund',
+      amount: refundAmount,
+      description: `Refund for rejected withdrawal: ${reason}`,
+      status: 'completed',
+    });
+
+    notifySubscribers('withdrawal_rejected');
+    return true;
+  } finally {
+    rejectingWithdrawalLocks.delete(cleanWId);
+  }
 }
 
 /**
- * Permanently delete a single withdrawal request by ID from both Firebase RTDB & local storage
+ * Permanently delete a single withdrawal request by ID from both Firebase RTDB & local storage.
+ * NOTE: Deleting a withdrawal from Admin Panel does NOT refund any amount to the user!
  */
 export async function deletePermanentWithdrawal(withdrawalId: string): Promise<boolean> {
   const cleanId = String(withdrawalId).trim();
@@ -1441,25 +1531,8 @@ export async function deletePermanentWithdrawal(withdrawalId: string): Promise<b
 
   markWithdrawalAsDeleted(cleanId);
 
-  // 1. Remove from local storage & refund if was pending
+  // 1. Remove from local storage WITHOUT refunding any balance to the user
   const current = getAllWithdrawals();
-  const target = current.find((w) => w.id === cleanId);
-  if (target && target.status === 'pending') {
-    const users = getAllUsers();
-    const u = users.find((x) => x.id === target.userId || x.telegramId === target.userId);
-    if (u) {
-      u.balance = Number((u.balance + target.amount).toFixed(2));
-      saveSingleUser(u);
-      addTransaction({
-        userId: target.userId,
-        type: 'withdrawal_refund',
-        amount: target.amount,
-        description: `Refund for deleted pending withdrawal request`,
-        status: 'completed',
-      });
-    }
-  }
-
   const filtered = current.filter((w) => w.id !== cleanId);
   saveWithdrawals(filtered);
 

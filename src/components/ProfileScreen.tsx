@@ -52,7 +52,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({
   return (
     <div className="w-full flex flex-col items-stretch pb-24 animate-fade-in select-none">
       {/* ----------------- 1. TOP PROFILE CARD (ROBOT AVATAR) ----------------- */}
-      <div className="w-full bg-white rounded-[32px] p-5 sm:p-6 shadow-xl shadow-blue-950/20 flex items-center gap-4">
+      <div className="w-full bg-white rounded-[32px] p-5 sm:p-6 shadow-md shadow-slate-900/5 border border-slate-100 flex items-center gap-4">
         {/* Robot Avatar (Secret 5-Tap opens Admin) */}
         <div
           onClick={handleAvatarTap}
@@ -66,7 +66,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({
           <h2 className="font-['Outfit'] font-black text-slate-900 text-xl sm:text-2xl leading-tight tracking-tight truncate">
             {displayName}
           </h2>
-          <p className="text-xs font-semibold text-slate-400 mt-0.5 mb-2 tracking-wide truncate">
+          <p className="text-xs font-semibold text-slate-500 mt-0.5 mb-2 tracking-wide truncate">
             User&nbsp;&nbsp;ID:&nbsp;&nbsp;#{displayId}
           </p>
           <div className="inline-flex items-center gap-1.5 bg-[#f0f9ff] text-[#0284c7] border border-[#bae6fd] px-3 py-1 rounded-full text-[10px] font-black tracking-wide">
@@ -78,14 +78,14 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({
 
       {/* ----------------- 2. SECTION HEADER ----------------- */}
       <div className="flex items-center gap-2 mt-5 mb-3 px-1">
-        <span className="w-1.5 h-5 bg-[#38bdf8] rounded-full inline-block"></span>
-        <h2 className="font-['Outfit'] font-black text-white text-xl tracking-tight">
+        <span className="w-1.5 h-5 bg-[#ff5e00] rounded-full inline-block"></span>
+        <h2 className="font-['Outfit'] font-black text-slate-900 text-xl tracking-tight">
           Quick Actions
         </h2>
       </div>
 
       {/* ----------------- 3. QUICK ACTIONS CARD (MATCHING SCREENSHOT) ----------------- */}
-      <div className="w-full bg-white rounded-[32px] p-2 shadow-2xl shadow-blue-950/25 divide-y divide-slate-100 overflow-hidden">
+      <div className="w-full bg-white rounded-[32px] p-2 shadow-md shadow-slate-900/5 border border-slate-100 divide-y divide-slate-100 overflow-hidden">
         {/* Row 1: Lucky Spin Wheel */}
         <button
           type="button"

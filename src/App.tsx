@@ -205,15 +205,21 @@ export default function App() {
   return (
     <div
       className={`min-h-screen w-full flex flex-col items-center justify-start transition-colors duration-300 overflow-x-hidden ${
-        activeTab === 'profile'
-          ? 'bg-gradient-to-b from-[#2855cf] via-[#2450c5] to-[#1c44b3] text-white'
-          : isDarkMode
+        isDarkMode
           ? 'dark-mode bg-gradient-to-b from-[#090d16] via-[#0f172a] to-[#090d16] text-slate-100'
           : 'bg-gradient-to-b from-[#fbfbfa] via-[#f8f9fa] to-[#f1f3f6] text-slate-800'
       }`}
     >
       {/* Mobile Telegram App View Container */}
-      <div className={`w-full max-w-md min-h-screen flex flex-col px-3 sm:px-4 ${activeTab === 'profile' ? 'pt-4' : 'pt-2'} pb-16 relative`}>
+      <div
+        className={`w-full max-w-md min-h-screen flex flex-col px-3 sm:px-4 ${
+          activeTab === 'profile' ? 'pt-4' : 'pt-2'
+        } pb-16 relative transition-colors duration-300 ${
+          isDarkMode
+            ? 'bg-transparent text-slate-100'
+            : 'bg-gradient-to-b from-[#fbfbfa] via-[#f8f9fa] to-[#f1f3f6] text-slate-800'
+        }`}
+      >
         {/* Header (shown on Home, Invite, Wallet; hidden on Profile to match screenshot) */}
         {activeTab !== 'profile' && (
           <Header

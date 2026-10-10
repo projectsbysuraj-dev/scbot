@@ -2042,26 +2042,60 @@ export async function creditReferralAfterFirstSpin(currentUserId: string): Promi
     saveUsers(allCurrentUsers);
   }
 
-  // Send Telegram Notification to Referrer ONLY after friend completes 1st scratch
+  // Send Telegram Notification to Referrer ONLY after friend completes 1st scratch (with Premium Animated Emojis)
   if (referredBy.match(/^\d+$/)) {
     const botTokens = [
       '8956392892:AAHHL_KxabHRt5_v3JYQGInzJhqNxDEUr5g',
       '8973201055:AAGiHa1ewSL0F_mG0v_f1WpMqK2lRySxSko',
       '8639853090:AAGSrArc6Xtm5309WpZeGih1H7evsvJstWE',
     ];
-    const alertText = `🎉 <b>1 Referral Join Successful! (+1 Scratch Card)</b>\n\n👤 Aapke friend <b>${userName}</b> ne 1st scratch card complete kar liya hai!\n\n🎁 <b>+1 Free Scratch Card</b> aapke account me add kar diya gaya hai!\n🎫 Available Scratch Cards: <b>${referrerSpins}</b>\n\nApp open karke scratch karein &amp; Win Up to ₹50! 💰`;
+    let emojiMap: Record<string, string> = {
+      '🎉': '5312486361243062266',
+      '👥': '5312424912994963580',
+      '🎁': '5312315739842026355',
+      '🔥': '5312241539987020022',
+      '✅': '5206607081334906820',
+    };
+    try {
+      const emResp = await fetch(`${RTDB_BASE_URL}/bot_config/premium_emojis.json`);
+      if (emResp.ok) {
+        const savedEm = await emResp.json();
+        if (savedEm && typeof savedEm === 'object') {
+          emojiMap = { ...emojiMap, ...savedEm };
+        }
+      }
+    } catch {
+      // Use default custom_emoji_ids
+    }
+    const pe = (ch: string) =>
+      emojiMap[ch] ? `<tg-emoji emoji-id="${emojiMap[ch]}">${ch}</tg-emoji>` : ch;
+
+    const premiumAlertText = `${pe('🎉')} <b>1 Referral Join Successful! (+1 Scratch Card)</b>\n\n${pe('👥')} Aapke friend <b>${userName}</b> ne 1st scratch card complete kar liya hai!\n\n${pe('🎁')} <b>+1 Free Scratch Card</b> aapke account me add kar diya gaya hai!\n${pe('✅')} Available Scratch Cards: <b>${referrerSpins}</b>\n\nApp open karke scratch karein &amp; Win Up to ₹50! ${pe('🔥')}`;
+    const plainAlertText = `🎉 <b>1 Referral Join Successful! (+1 Scratch Card)</b>\n\n👥 Aapke friend <b>${userName}</b> ne 1st scratch card complete kar liya hai!\n\n🎁 <b>+1 Free Scratch Card</b> aapke account me add kar diya gaya hai!\n✅ Available Scratch Cards: <b>${referrerSpins}</b>\n\nApp open karke scratch karein &amp; Win Up to ₹50! 🔥`;
 
     for (const token of botTokens) {
       try {
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        const r1 = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: Number(referredBy),
-            text: alertText,
+            text: premiumAlertText,
             parse_mode: 'HTML',
           }),
         });
+        const d1 = await r1.json().catch(() => ({ ok: false }));
+        if (!d1?.ok) {
+          await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: Number(referredBy),
+              text: plainAlertText,
+              parse_mode: 'HTML',
+            }),
+          });
+        }
         break;
       } catch (e) {
         // Continue to fallback token if any error

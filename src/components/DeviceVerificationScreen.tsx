@@ -117,37 +117,96 @@ export function DeviceVerificationScreen({
       }
     }
 
-    // 2. Send Congratulations message directly via Telegram Bot API with Mini App Link
+    // 2. Send Congratulations message directly via Telegram Bot API with Premium Animated Emojis & Mini App Link
     if (rawUserCleanId && rawUserCleanId.match(/^\d+$/)) {
       try {
-        const text = `🔥<b>Congratulations Sussefuly Verfied</b> ✅\n🎉 <b>Click To Home And Refer And Earn</b> 🎉\n✅✅<b>Now All Payment Instant</b> ✅✅`;
-        const payload = {
-          chat_id: Number(rawUserCleanId),
-          text: text,
-          parse_mode: 'HTML',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: '🎉 Click To Home',
-                  web_app: { url: appUrl },
-                },
-              ],
-              [
-                {
-                  text: '👥 Refer And Earn',
-                  callback_data: 'my_invite',
-                },
-              ],
+        let emojiMap: Record<string, string> = {
+          '🔥': '5312241539987020022',
+          '✅': '5206607081334906820',
+          '🎁': '5312315739842026355',
+          '🎉': '5312486361243062266',
+          '👥': '5312424912994963580',
+        };
+        try {
+          const emResp = await fetch('https://scratch-7d728-default-rtdb.firebaseio.com/bot_config/premium_emojis.json');
+          if (emResp.ok) {
+            const savedEm = await emResp.json();
+            if (savedEm && typeof savedEm === 'object') {
+              emojiMap = { ...emojiMap, ...savedEm };
+            }
+          }
+        } catch {
+          // Use default verified custom_emoji_ids
+        }
+
+        const pe = (ch: string) =>
+          emojiMap[ch] ? `<tg-emoji emoji-id="${emojiMap[ch]}">${ch}</tg-emoji>` : ch;
+
+        const premiumText = `${pe('🔥')}<b>Congratulations Sussefuly Verfied</b> ${pe('✅')}\n${pe('🎁')} <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n${pe('🎉')} <b>Click To Home And Refer And Earn</b> ${pe('🎉')}\n${pe('✅')}${pe('✅')}<b>Now All Payment Instant</b> ${pe('✅')}${pe('✅')}`;
+
+        const premiumMarkup = {
+          inline_keyboard: [
+            [
+              {
+                text: '🎉 Click To Home (Win Up to ₹50)',
+                icon_custom_emoji_id: emojiMap['🎉'],
+                web_app: { url: appUrl },
+              },
             ],
-          },
+            [
+              {
+                text: '👥 Refer And Earn (1 Refer = 1 Scratch)',
+                icon_custom_emoji_id: emojiMap['👥'],
+                callback_data: 'my_invite',
+              },
+            ],
+          ],
         };
 
-        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        const res1 = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
+          body: JSON.stringify({
+            chat_id: Number(rawUserCleanId),
+            text: premiumText,
+            parse_mode: 'HTML',
+            reply_markup: premiumMarkup,
+          }),
         });
+        const data1 = await res1.json().catch(() => ({ ok: false }));
+        if (!data1?.ok) {
+          // Fallback without button icon_custom_emoji_id while preserving <tg-emoji> in text
+          const fallbackMarkup = {
+            inline_keyboard: [
+              [{ text: '🎉 Click To Home (Win Up to ₹50)', web_app: { url: appUrl } }],
+              [{ text: '👥 Refer And Earn (1 Refer = 1 Scratch)', callback_data: 'my_invite' }],
+            ],
+          };
+          const res2 = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: Number(rawUserCleanId),
+              text: premiumText,
+              parse_mode: 'HTML',
+              reply_markup: fallbackMarkup,
+            }),
+          });
+          const data2 = await res2.json().catch(() => ({ ok: false }));
+          if (!data2?.ok) {
+            const plainText = `🔥<b>Congratulations Sussefuly Verfied</b> ✅\n🎁 <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n🎉 <b>Click To Home And Refer And Earn</b> 🎉\n✅✅<b>Now All Payment Instant</b> ✅✅`;
+            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: Number(rawUserCleanId),
+                text: plainText,
+                parse_mode: 'HTML',
+                reply_markup: fallbackMarkup,
+              }),
+            });
+          }
+        }
       } catch (err) {
         console.warn('Could not send telegram message:', err);
       }

@@ -342,11 +342,158 @@ def is_channel_joined_in_db(user_id: str, channel_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 8. CHANNELS & OWNERS DYNAMIC MANAGEMENT
+# 8. CHANNELS, OWNERS & TELEGRAM PREMIUM ANIMATED EMOJI ENGINE
 # ---------------------------------------------------------------------------
 _CHANNELS_CACHE = []
 _OWNERS_CACHE = set(o.lower().lstrip("@") for o in DEFAULT_OWNERS)
 _LAST_CACHE_TIME = 0
+
+# Verified Telegram Custom Emoji IDs (Auto-enriched at startup via Telegram API + Firebase RTDB)
+_PREMIUM_EMOJI_MAP = {
+    "✔": "5206607081334906820",
+    "✅": "5206607081334906820",
+    "🔥": "5312241539987020022",
+    "👑": "5312322066328853156",
+    "🎉": "5312486361243062266",
+    "🎁": "5312315739842026355",
+    "🌺": "5312138559556164615",
+    "😍": "5312513303690351633",
+    "🍑": "5312383351024260855",
+    "👥": "5312424912994963580",
+    "🚀": "5312409003186199286",
+    "⚠️": "5312526098985124879",
+    "🔄": "5312189624351726761",
+    "👌": "5368324170671202286",
+    "🔗": "5312361223344363506",
+    "📊": "5312279665405073798",
+    "🚫": "5312157676413655955",
+}
+
+
+def pe(char: str) -> str:
+    """
+    Wraps a normal emoji in Telegram Premium <tg-emoji emoji-id="...">char</tg-emoji> tag.
+    """
+    eid = _PREMIUM_EMOJI_MAP.get(char)
+    if eid:
+        return f'<tg-emoji emoji-id="{eid}">{char}</tg-emoji>'
+    return char
+
+
+def pbtn(text: str, emoji_char: str = None, **kwargs) -> dict:
+    """
+    Creates an InlineKeyboardButton with Telegram Premium icon_custom_emoji_id
+    (Bot API 9.4+) alongside standard fallback.
+    """
+    btn = {"text": text}
+    btn.update(kwargs)
+    if emoji_char and _PREMIUM_EMOJI_MAP.get(emoji_char):
+        btn["icon_custom_emoji_id"] = str(_PREMIUM_EMOJI_MAP[emoji_char])
+    return btn
+
+
+def init_premium_emojis():
+    """
+    Fetches official live animated custom_emoji_id stickers directly from Telegram's servers
+    (getForumTopicIconStickers) and merges any owner-saved custom emoji IDs from Firebase RTDB.
+    """
+    global _PREMIUM_EMOJI_MAP
+    try:
+        res = tg_api("getForumTopicIconStickers", {})
+        if res.get("ok") and isinstance(res.get("result"), list):
+            stickers = res["result"]
+            by_emoji = {}
+            all_ids = []
+            for st in stickers:
+                cid = str(st.get("custom_emoji_id", "")).strip()
+                em = st.get("emoji", "")
+                if cid:
+                    all_ids.append(cid)
+                    if em and em not in by_emoji:
+                        by_emoji[em] = cid
+
+            # Map exact matching base emojis from Telegram official animated topic icons
+            for k in list(_PREMIUM_EMOJI_MAP.keys()):
+                if k in by_emoji:
+                    _PREMIUM_EMOJI_MAP[k] = by_emoji[k]
+
+            # Also map related semantic emojis from official stickers if available
+            alias_pairs = [
+                ("👑", ["👑", "🏆", "⭐", "💎"]),
+                ("🔥", ["🔥", "⚡", "💥"]),
+                ("🎉", ["🎉", "🥳", "🎊", "✨"]),
+                ("🎁", ["🎁", "💎", "🏆", "💰"]),
+                ("🌺", ["🌺", "🌸", "🌷", "🌹", "🌻", "🍀"]),
+                ("😍", ["😍", "❤️", "💖", "🥰", "🤩"]),
+                ("🍑", ["🍑", "🍓", "🍒", "🍎", "🔥"]),
+                ("👥", ["👥", "👤", "💬", "📢"]),
+                ("🚀", ["🚀", "⚡", "🔥"]),
+                ("⚠️", ["⚠️", "❗", "❓", "🔔"]),
+                ("🔄", ["🔄", "⚡", "⏳"]),
+                ("👌", ["👌", "👍", "✅"]),
+                ("🔗", ["🔗", "📌", "📎"]),
+                ("📊", ["📊", "📈", "💼"]),
+                ("🚫", ["🚫", "❌", "⛔"]),
+            ]
+            for target_em, candidates in alias_pairs:
+                for cand in candidates:
+                    if cand in by_emoji:
+                        _PREMIUM_EMOJI_MAP[target_em] = by_emoji[cand]
+                        break
+    except Exception as e:
+        logger.debug(f"init_premium_emojis topic stickers note: {e}")
+
+    # Load any custom emoji overrides saved by owner via /setemojis in Firebase RTDB
+    try:
+        saved = db_request("bot_config/premium_emojis.json")
+        if isinstance(saved, dict):
+            for k, v in saved.items():
+                if v:
+                    _PREMIUM_EMOJI_MAP[k] = str(v).strip()
+    except Exception as e:
+        logger.debug(f"init_premium_emojis rtdb note: {e}")
+
+
+def send_message_smart(chat_id, text: str, reply_markup: dict = None, parse_mode: str = "HTML") -> dict:
+    """
+    Sends a message with Premium <tg-emoji> tags and button icon_custom_emoji_id.
+    Automatically falls back cleanly if any button icon_custom_emoji_id is rejected.
+    """
+    res = send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    if not res.get("ok") and reply_markup:
+        # Strip icon_custom_emoji_id from buttons if needed and retry while keeping <tg-emoji> in text
+        clean_rows = []
+        for row in reply_markup.get("inline_keyboard", []):
+            clean_row = []
+            for b in row:
+                cb = dict(b)
+                cb.pop("icon_custom_emoji_id", None)
+                clean_row.append(cb)
+            clean_rows.append(clean_row)
+        res = send_message(chat_id, text, reply_markup={"inline_keyboard": clean_rows}, parse_mode=parse_mode)
+    if not res.get("ok"):
+        # Final safety fallback stripping <tg-emoji> wrapper tags so message never fails
+        plain_html = re.sub(r'<tg-emoji[^>]*>(.*?)</tg-emoji>', r'\1', text)
+        res = send_message(chat_id, plain_html, reply_markup=reply_markup, parse_mode=parse_mode)
+    return res
+
+
+def edit_message_text_smart(chat_id, message_id: int, text: str, reply_markup: dict = None, parse_mode: str = "HTML") -> dict:
+    res = edit_message_text(chat_id, message_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    if not res.get("ok") and reply_markup:
+        clean_rows = []
+        for row in reply_markup.get("inline_keyboard", []):
+            clean_row = []
+            for b in row:
+                cb = dict(b)
+                cb.pop("icon_custom_emoji_id", None)
+                clean_row.append(cb)
+            clean_rows.append(clean_row)
+        res = edit_message_text(chat_id, message_id, text, reply_markup={"inline_keyboard": clean_rows}, parse_mode=parse_mode)
+    if not res.get("ok"):
+        plain_html = re.sub(r'<tg-emoji[^>]*>(.*?)</tg-emoji>', r'\1', text)
+        res = edit_message_text(chat_id, message_id, plain_html, reply_markup=reply_markup, parse_mode=parse_mode)
+    return res
 
 
 def load_channels() -> list[dict]:
@@ -383,13 +530,13 @@ def is_owner(user: dict) -> bool:
 def build_channels_keyboard(channels: list[dict], ref_param: str = None) -> dict:
     buttons = []
     for i in range(0, len(channels), 2):
-        row = [{"text": "✔ Join", "url": channels[i]["url"]}]
+        row = [pbtn("✔ Join", emoji_char="✅", url=channels[i]["url"])]
         if i + 1 < len(channels):
-            row.append({"text": "✔ Join", "url": channels[i + 1]["url"]})
+            row.append(pbtn("✔ Join", emoji_char="✅", url=channels[i + 1]["url"]))
         buttons.append(row)
 
     claim_callback = f"claim_{ref_param or 'none'}"
-    buttons.append([{"text": "✔ Claim", "callback_data": claim_callback}])
+    buttons.append([pbtn("✔ Claim", emoji_char="✅", callback_data=claim_callback)])
     return {"inline_keyboard": buttons}
 
 
@@ -506,10 +653,10 @@ def handle_start(chat_id, user: dict, args: list[str]):
             db_request(f"users/{user_id}.json", method="PATCH", data=patch_data)
 
     if is_blocked:
-        send_message(
+        send_message_smart(
             chat_id,
-            "🚫 <b>Device Verification Failed / Account Blocked!</b>\n\n"
-            "Ek phone me sirf 1 account allow hai. Ye ID permanently block ho chuki hai.",
+            f"{pe('🚫')} <b>Device Verification Failed / Account Blocked!</b>\n\n"
+            f"Ek phone me sirf 1 account allow hai. Ye ID permanently block ho chuki hai.",
         )
         return
 
@@ -517,29 +664,29 @@ def handle_start(chat_id, user: dict, args: list[str]):
         app_url = f"{WEB_URL}/?uid={user_id}&start=ref_{referrer_id}" if referrer_id else f"{WEB_URL}/?uid={user_id}"
         verified_markup = {
             "inline_keyboard": [
-                [{"text": "🎉 Click To Home (Win Up to ₹50)", "web_app": {"url": app_url}}],
-                [{"text": "👥 Refer And Earn (1 Refer = 1 Scratch)", "callback_data": "my_invite"}],
+                [pbtn("🎉 Click To Home (Win Up to ₹50)", emoji_char="🎉", web_app={"url": app_url})],
+                [pbtn("👥 Refer And Earn (1 Refer = 1 Scratch)", emoji_char="👥", callback_data="my_invite")],
             ]
         }
         verified_text = (
-            "🔥<b>Congratulations Sussefuly Verfied</b> ✅\n"
-            "🎁 <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n"
-            "🎉 <b>Click To Home And Refer And Earn</b> 🎉\n"
-            "✅✅<b>Now All Payment Instant</b> ✅✅"
+            f"{pe('🔥')}<b>Congratulations Sussefuly Verfied</b> {pe('✅')}\n"
+            f"{pe('🎁')} <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n"
+            f"{pe('🎉')} <b>Click To Home And Refer And Earn</b> {pe('🎉')}\n"
+            f"{pe('✅')}{pe('✅')}<b>Now All Payment Instant</b> {pe('✅')}{pe('✅')}"
         )
-        send_message(chat_id, verified_text, reply_markup=verified_markup)
+        send_message_smart(chat_id, verified_text, reply_markup=verified_markup)
         return
 
     channels = load_channels()
     welcome_text = (
-        "👑 <b>Hey There! Welcome To Scratch The Win !!</b>\n"
-        "🎁 <b>1 Sign Up = 1 Free Scratch Card (Win Up to ₹50)</b>\n"
-        "👥 <b>1 Refer = 1 Free Scratch Card</b>\n\n"
-        "🌺 <b>Join The Channels Below To Continue</b>\n\n"
-        "😍 <b>After Joining Click Claim</b>"
+        f"{pe('👑')} <b>Hey There! Welcome To Scratch The Win !!</b>\n"
+        f"{pe('🎁')} <b>1 Sign Up = 1 Free Scratch Card (Win Up to ₹50)</b>\n"
+        f"{pe('👥')} <b>1 Refer = 1 Free Scratch Card</b>\n\n"
+        f"{pe('🌺')} <b>Join The Channels Below To Continue</b>\n\n"
+        f"{pe('😍')} <b>After Joining Click Claim</b>"
     )
     markup = build_channels_keyboard(channels, ref_param)
-    send_message(chat_id, welcome_text, reply_markup=markup)
+    send_message_smart(chat_id, welcome_text, reply_markup=markup)
 
 
 def handle_claim_callback(query: dict):
@@ -570,16 +717,16 @@ def handle_claim_callback(query: dict):
 
     step2_markup = {
         "inline_keyboard": [
-            [{"text": "🍑 Please Click Verify Device ✅", "web_app": {"url": verify_url}}],
-            [{"text": "🔄 Check Status", "callback_data": f"check_device_{ref_param or 'none'}"}],
+            [pbtn("🍑 Please Click Verify Device ✅", emoji_char="🍑", web_app={"url": verify_url})],
+            [pbtn("🔄 Check Status", emoji_char="🔄", callback_data=f"check_device_{ref_param or 'none'}")],
         ]
     }
     step2_text = (
-        "<b>All Channel Verfied Done ✅👌</b>\n"
-        "⚠️<b>Step 2:- Device verification</b>\n"
-        "🍑 <b>Please Click Verify Device ✅</b>"
+        f"<b>All Channel Verfied Done {pe('✅')}{pe('👌')}</b>\n"
+        f"{pe('⚠️')}<b>Step 2:- Device verification</b>\n"
+        f"{pe('🍑')} <b>Please Click Verify Device {pe('✅')}</b>"
     )
-    edit_message_text(chat_id, message_id, step2_text, reply_markup=step2_markup)
+    edit_message_text_smart(chat_id, message_id, step2_text, reply_markup=step2_markup)
 
 
 def handle_check_device_callback(query: dict):
@@ -620,17 +767,17 @@ def handle_check_device_callback(query: dict):
     app_url = f"{WEB_URL}/?uid={user_id}&start={ref_param}" if ref_param else f"{WEB_URL}/?uid={user_id}"
     final_markup = {
         "inline_keyboard": [
-            [{"text": "🎉 Click To Home (Win Up to ₹50)", "web_app": {"url": app_url}}],
-            [{"text": "👥 Refer And Earn (1 Refer = 1 Scratch)", "callback_data": "my_invite"}],
+            [pbtn("🎉 Click To Home (Win Up to ₹50)", emoji_char="🎉", web_app={"url": app_url})],
+            [pbtn("👥 Refer And Earn (1 Refer = 1 Scratch)", emoji_char="👥", callback_data="my_invite")],
         ]
     }
     final_text = (
-        "🔥<b>Congratulations Sussefuly Verfied</b> ✅\n"
-        "🎁 <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n"
-        "🎉 <b>Click To Home And Refer And Earn</b> 🎉\n"
-        "✅✅<b>Now All Payment Instant</b> ✅✅"
+        f"{pe('🔥')}<b>Congratulations Sussefuly Verfied</b> {pe('✅')}\n"
+        f"{pe('🎁')} <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n"
+        f"{pe('🎉')} <b>Click To Home And Refer And Earn</b> {pe('🎉')}\n"
+        f"{pe('✅')}{pe('✅')}<b>Now All Payment Instant</b> {pe('✅')}{pe('✅')}"
     )
-    edit_message_text(chat_id, message_id, final_text, reply_markup=final_markup)
+    edit_message_text_smart(chat_id, message_id, final_text, reply_markup=final_markup)
 
 
 def handle_invite(chat_id, user: dict):
@@ -650,36 +797,36 @@ def handle_invite(chat_id, user: dict):
 
     markup = {
         "inline_keyboard": [
-            [{"text": "🚀 Share Invite Link", "url": share_url}],
-            [{"text": "🎉 Click To Home (Win Up to ₹50)", "web_app": {"url": f"{WEB_URL}/?uid={user_id}"}}],
+            [pbtn("🚀 Share Invite Link", emoji_char="🚀", url=share_url)],
+            [pbtn("🎉 Click To Home (Win Up to ₹50)", emoji_char="🎉", web_app={"url": f"{WEB_URL}/?uid={user_id}"})],
         ]
     }
 
     msg = (
-        f"🎉 <b>Scratch &amp; Win Up to ₹50 - Refer And Earn</b> 🎉\n\n"
-        f"🔗 <b>Your Personal Invite Link:</b>\n"
+        f"{pe('🎉')} <b>Scratch &amp; Win Up to ₹50 - Refer And Earn</b> {pe('🎉')}\n\n"
+        f"{pe('🔗')} <b>Your Personal Invite Link:</b>\n"
         f"<code>{invite_link}</code>\n\n"
-        f"🎁 <b>Rewards:</b>\n"
+        f"{pe('🎁')} <b>Rewards:</b>\n"
         f"• <b>1 Sign Up = 1 Free Scratch Card</b> (Win Up to ₹50)\n"
         f"• <b>1 Refer = 1 Free Scratch Card</b> (Jab friend 1st card scratch kare)\n"
-        f"• ✅✅ <b>Now All Payment Instant</b> ✅✅\n\n"
-        f"📊 <b>Your Stats:</b>\n"
+        f"• {pe('✅')}{pe('✅')} <b>Now All Payment Instant</b> {pe('✅')}{pe('✅')}\n\n"
+        f"{pe('📊')} <b>Your Stats:</b>\n"
         f"• Friends Joined: <b>{friends}</b>\n"
         f"• Available Scratch Cards: <b>{spins}</b>"
     )
-    send_message(chat_id, msg, reply_markup=markup)
+    send_message_smart(chat_id, msg, reply_markup=markup)
 
 
 def handle_help(chat_id):
     text = (
-        "👑 <b>SCRATCH THE WIN - HELP & GUIDE</b> 👑\n\n"
-        "1. <b>/start</b> - App start karein aur channels join karein\n"
-        "2. <b>/invite</b> - Apna personal referral link paayein (+1 Scratch per invite)\n\n"
-        "🔥 <b>Congratulations Sussefuly Verfied ✅</b>\n"
-        "🎉 <b>Click To Home And Refer And Earn 🎉</b>\n"
-        "✅✅ <b>Now All Payment Instant ✅✅</b>"
+        f"{pe('👑')} <b>SCRATCH THE WIN - HELP & GUIDE</b> {pe('👑')}\n\n"
+        f"1. <b>/start</b> - App start karein aur channels join karein\n"
+        f"2. <b>/invite</b> - Apna personal referral link paayein (+1 Scratch per invite)\n\n"
+        f"{pe('🔥')} <b>Congratulations Sussefuly Verfied {pe('✅')}</b>\n"
+        f"{pe('🎉')} <b>Click To Home And Refer And Earn {pe('🎉')}</b>\n"
+        f"{pe('✅')}{pe('✅')} <b>Now All Payment Instant {pe('✅')}{pe('✅')}</b>"
     )
-    send_message(chat_id, text)
+    send_message_smart(chat_id, text)
 
 
 def handle_ownerhelp(chat_id, user: dict):
@@ -687,16 +834,67 @@ def handle_ownerhelp(chat_id, user: dict):
         send_message(chat_id, "❌ Permission denied!")
         return
     text = (
-        "👑 <b>OWNER ADMIN COMMANDS</b> 👑\n\n"
-        "• <b>/channels</b> - Active mandatory channels list dekhein\n"
-        "• <b>/addchannel &lt;chat_id_or_@username&gt; &lt;name&gt; &lt;url&gt;</b> - Naya channel add karein\n"
-        "• <b>/removechannel &lt;chat_id_or_username&gt;</b> - Channel remove karein\n"
-        "• <b>/emojitest</b> (Reply karke) - 🧪 Telegram Premium animated custom emojis preview test karein\n"
-        "• <b>/broadcast</b> (Reply karke) - 💎 Telegram Premium custom emojis & media sabhi users ko bhejein\n"
-        "• <b>/broadcast &lt;text&gt;</b> - Direct broadcast\n"
-        "• <b>/stats</b> - Total users & referrals check karein"
+        f"{pe('👑')} <b>OWNER ADMIN COMMANDS</b> {pe('👑')}\n\n"
+        f"• <b>/channels</b> - Active mandatory channels list dekhein\n"
+        f"• <b>/addchannel &lt;chat_id_or_@username&gt; &lt;name&gt; &lt;url&gt;</b> - Naya channel add karein\n"
+        f"• <b>/removechannel &lt;chat_id_or_username&gt;</b> - Channel remove karein\n"
+        f"• <b>/setemojis</b> (Reply karke) - ✨ Apne pasand ke Premium Animated Emojis bot ke replies/buttons me set karein\n"
+        f"• <b>/emojitest</b> (Reply karke) - 🧪 Telegram Premium animated custom emojis preview test karein\n"
+        f"• <b>/broadcast</b> (Reply karke) - 💎 Telegram Premium custom emojis & media sabhi users ko bhejein\n"
+        f"• <b>/broadcast &lt;text&gt;</b> - Direct broadcast\n"
+        f"• <b>/stats</b> - Total users & referrals check karein"
     )
-    send_message(chat_id, text)
+    send_message_smart(chat_id, text)
+
+
+def handle_setemojis(chat_id, user: dict, message: dict):
+    """
+    Allows the owner to reply to any message containing their favorite Telegram Premium
+    animated emojis with /setemojis to automatically bind those custom_emoji_ids to the bot's replies & buttons.
+    """
+    if not is_owner(user):
+        send_message(chat_id, "❌ Permission denied!")
+        return
+
+    target_msg = message.get("reply_to_message") or message
+    full_text = target_msg.get("text") or target_msg.get("caption") or ""
+    entities = target_msg.get("entities") or target_msg.get("caption_entities") or []
+    utf16_bytes = full_text.encode("utf-16-le")
+
+    updated = {}
+    for ent in entities:
+        if ent.get("type") == "custom_emoji" and ent.get("custom_emoji_id"):
+            offset = ent.get("offset", 0)
+            length = ent.get("length", 0)
+            cid = str(ent["custom_emoji_id"]).strip()
+            try:
+                underlying_char = utf16_bytes[offset * 2 : (offset + length) * 2].decode("utf-16-le").strip()
+                if underlying_char:
+                    _PREMIUM_EMOJI_MAP[underlying_char] = cid
+                    updated[underlying_char] = cid
+                    if underlying_char in ("✅", "☑️", "✔️", "✔"):
+                        _PREMIUM_EMOJI_MAP["✅"] = cid
+                        _PREMIUM_EMOJI_MAP["✔"] = cid
+                        updated["✅"] = cid
+                        updated["✔"] = cid
+            except Exception:
+                continue
+
+    if not updated:
+        send_message_smart(
+            chat_id,
+            f"{pe('👑')} <b>CUSTOM PREMIUM EMOJI SETTER</b>\n\n"
+            f"Apne Telegram Premium se koi bhi animated emojis (jaise 👑 🌺 😍 ✅ 🔥 🎉 🍑 👥 🚀) ek message me bhejein aur us message ko <b>Reply</b> karke <code>/setemojis</code> likhein!\n\n"
+            f"Bot turant unki exact <code>custom_emoji_id</code> save kar lega aur har reply + button me wahi animated emojis bhejega!",
+        )
+        return
+
+    db_request("bot_config/premium_emojis.json", method="PATCH", data=updated)
+    summary = "\n".join([f"• <tg-emoji emoji-id=\"{cid}\">{em}</tg-emoji> (<code>{cid}</code>)" for em, cid in updated.items()])
+    send_message_smart(
+        chat_id,
+        f"{pe('✅')} <b>{len(updated)} Premium Animated Emojis Updated in Bot!</b>\n\n{summary}",
+    )
 
 
 def handle_stats(chat_id, user: dict):
@@ -708,13 +906,13 @@ def handle_stats(chat_id, user: dict):
     total_refs = len(referrals) if isinstance(referrals, dict) else len(referrals or [])
 
     text = (
-        f"📊 <b>BOT LIVE STATS</b> 📊\n\n"
-        f"👥 Total Registered Users: <b>{total_users}</b>\n"
-        f"🔗 Active Referrals: <b>{total_refs}</b>\n"
-        f"🌐 Web App URL: <code>{WEB_URL}</code>\n"
-        f"🟢 Server Status: <b>Online 24/7</b>"
+        f"{pe('📊')} <b>BOT LIVE STATS</b> {pe('📊')}\n\n"
+        f"{pe('👥')} Total Registered Users: <b>{total_users}</b>\n"
+        f"{pe('🔗')} Active Referrals: <b>{total_refs}</b>\n"
+        f"{pe('🚀')} Web App URL: <code>{WEB_URL}</code>\n"
+        f"{pe('✅')} Server Status: <b>Online 24/7</b>"
     )
-    send_message(chat_id, text)
+    send_message_smart(chat_id, text)
 
 
 def handle_channels(chat_id, user: dict):
@@ -722,10 +920,10 @@ def handle_channels(chat_id, user: dict):
         return
     channels = load_channels()
     if not channels:
-        send_message(chat_id, "📢 Koi channels configured nahi hain! Use <code>/addchannel</code>")
+        send_message_smart(chat_id, f"{pe('⚠️')} Koi channels configured nahi hain! Use <code>/addchannel</code>")
         return
 
-    lines = [f"📢 <b>ACTIVE CHANNELS ({len(channels)}):</b>\n"]
+    lines = [f"{pe('👑')} <b>ACTIVE CHANNELS ({len(channels)}):</b>\n"]
     for idx, ch in enumerate(channels, 1):
         lines.append(
             f"{idx}. <b>{ch.get('name', 'Channel')}</b>\n"
@@ -734,17 +932,17 @@ def handle_channels(chat_id, user: dict):
         )
     lines.append("\n💡 <i>To add: /addchannel &lt;id&gt; &lt;name&gt; &lt;url&gt;</i>")
     lines.append("💡 <i>To remove: /removechannel &lt;id&gt;</i>")
-    send_message(chat_id, "\n\n".join(lines))
+    send_message_smart(chat_id, "\n\n".join(lines))
 
 
 def handle_addchannel(chat_id, user: dict, args: list[str]):
     if not is_owner(user):
-        send_message(chat_id, "❌ Permission denied!")
+        send_message_smart(chat_id, f"{pe('🚫')} Permission denied!")
         return
     if len(args) < 3:
-        send_message(
+        send_message_smart(
             chat_id,
-            "⚠️ <b>Usage:</b>\n"
+            f"{pe('⚠️')} <b>Usage:</b>\n"
             "<code>/addchannel &lt;chat_id_or_@username&gt; &lt;name&gt; &lt;url&gt;</code>\n\n"
             "<b>Example:</b>\n"
             "<code>/addchannel @mychannel VIP Official Channel https://t.me/mychannel</code>",
@@ -770,23 +968,23 @@ def handle_addchannel(chat_id, user: dict, args: list[str]):
     _CHANNELS_CACHE = []
     load_channels()
 
-    send_message(
+    send_message_smart(
         chat_id,
-        f"✅ <b>Channel Added Successfully!</b>\n\n"
-        f"📢 <b>Name:</b> {name}\n"
-        f"🆔 <b>ID:</b> <code>{ch_id}</code>\n"
-        f"🔗 <b>URL:</b> {url}",
+        f"{pe('✅')} <b>Channel Added Successfully!</b>\n\n"
+        f"{pe('👑')} <b>Name:</b> {name}\n"
+        f"{pe('🔗')} <b>ID:</b> <code>{ch_id}</code>\n"
+        f"{pe('🚀')} <b>URL:</b> {url}",
     )
 
 
 def handle_removechannel(chat_id, user: dict, args: list[str]):
     if not is_owner(user):
-        send_message(chat_id, "❌ Permission denied!")
+        send_message_smart(chat_id, f"{pe('🚫')} Permission denied!")
         return
     if not args:
-        send_message(
+        send_message_smart(
             chat_id,
-            "⚠️ <b>Usage:</b> <code>/removechannel &lt;chat_id_or_username&gt;</code>\n"
+            f"{pe('⚠️')} <b>Usage:</b> <code>/removechannel &lt;chat_id_or_username&gt;</code>\n"
             "Use <code>/channels</code> to see the list.",
         )
         return
@@ -802,34 +1000,34 @@ def handle_removechannel(chat_id, user: dict, args: list[str]):
     _CHANNELS_CACHE = []
     load_channels()
 
-    send_message(chat_id, f"🗑️ <b>Channel {target_id} Removed Successfully!</b>")
+    send_message_smart(chat_id, f"{pe('✅')} <b>Channel {target_id} Removed Successfully!</b>")
 
 
 def handle_emojitest(chat_id, user: dict, message: dict):
     if not is_owner(user):
-        send_message(chat_id, "❌ Permission denied!")
+        send_message_smart(chat_id, f"{pe('🚫')} Permission denied!")
         return
     reply_msg = message.get("reply_to_message")
     if reply_msg:
         custom_count = len([e for e in (reply_msg.get("entities") or reply_msg.get("caption_entities") or []) if e.get("type") == "custom_emoji"])
-        send_message(
+        send_message_smart(
             chat_id,
-            f"🧪 <b>PREMIUM EMOJI TEST PREVIEW ({custom_count} Custom Emojis Detected):</b>\n"
+            f"{pe('🔥')} <b>PREMIUM EMOJI TEST PREVIEW ({custom_count} Custom Emojis Detected):</b>\n"
             f"Niche aapka message 100% original Premium Animated Emojis ke saath aa raha hai 👇",
         )
         res = deliver_premium_message(chat_id, chat_id, reply_msg)
         if res.get("ok"):
-            send_message(
+            send_message_smart(
                 chat_id,
-                "✅ <b>Premium Custom Emojis Verified!</b>\n"
+                f"{pe('✅')} <b>Premium Custom Emojis Verified!</b>\n"
                 "Ab usi message ko <b>Reply</b> karke <code>/broadcast</code> likhein — sabhi users ko exact animated premium emojis jayenge!",
             )
         else:
-            send_message(chat_id, f"⚠️ Test preview failed: {res.get('description')}")
+            send_message_smart(chat_id, f"{pe('⚠️')} Test preview failed: {res.get('description')}")
     else:
-        send_message(
+        send_message_smart(
             chat_id,
-            "🧪 <b>EMOJI & MEDIA TEST GUIDE:</b>\n\n"
+            f"{pe('🔥')} <b>EMOJI & MEDIA TEST GUIDE:</b>\n\n"
             "Apne Telegram Premium animated emojis wale message ko <b>Reply</b> karein aur likhein: <code>/emojitest</code>",
         )
 
@@ -863,9 +1061,9 @@ def handle_broadcast(chat_id, user: dict, message: dict):
     direct_text = full_text[prefix_len:]
 
     if not reply_msg and not direct_text.strip():
-        send_message(
+        send_message_smart(
             chat_id,
-            "📢 <b>PREMIUM BROADCAST GUIDE:</b>\n\n"
+            f"{pe('👑')} <b>PREMIUM BROADCAST GUIDE:</b>\n\n"
             "1. Apne custom animated emojis, photos, ya media wale message ko <b>Reply</b> karein aur likhein: <code>/broadcast</code> (Recommended for 100% Premium Emojis)\n"
             "2. Direct bhejne ke liye: <code>/broadcast &lt;message&gt;</code>",
         )
@@ -891,10 +1089,10 @@ def handle_broadcast(chat_id, user: dict, message: dict):
                 continue
 
     if not valid_user_ids:
-        send_message(chat_id, "⚠️ Database me koi users nahi mile!")
+        send_message_smart(chat_id, f"{pe('⚠️')} Database me koi users nahi mile!")
         return
 
-    send_message(chat_id, f"🚀 Premium Broadcast shuru ho raha hai {len(valid_user_ids)} users ko...")
+    send_message_smart(chat_id, f"{pe('🚀')} Premium Broadcast shuru ho raha hai {len(valid_user_ids)} users ko...")
 
     sent = 0
     failed = 0
@@ -923,9 +1121,9 @@ def handle_broadcast(chat_id, user: dict, message: dict):
             failed += 1
         time.sleep(0.04)
 
-    send_message(
+    send_message_smart(
         chat_id,
-        f"✅ <b>Broadcast Completed!</b>\nDelivered: <b>{sent}</b> | Failed/Blocked: <b>{failed}</b>",
+        f"{pe('✅')} <b>Broadcast Completed!</b>\nDelivered: <b>{sent}</b> | Failed/Blocked: <b>{failed}</b>",
     )
 
 
@@ -990,6 +1188,8 @@ def process_update(upd: dict):
             handle_addchannel(chat_id, user, args)
         elif cmd == "/removechannel":
             handle_removechannel(chat_id, user, args)
+        elif cmd == "/setemojis":
+            handle_setemojis(chat_id, user, msg)
         elif cmd == "/emojitest":
             handle_emojitest(chat_id, user, msg)
         elif cmd == "/broadcast":
@@ -1007,6 +1207,9 @@ def main():
     # Start 24/7 HTTP Health Check Server
     t = threading.Thread(target=start_health_server, daemon=True)
     t.start()
+
+    # Load live Telegram Premium Animated Emoji IDs
+    init_premium_emojis()
 
     # Delete any active webhook & drop pending updates
     tg_api("deleteWebhook", {"drop_pending_updates": True})

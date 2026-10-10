@@ -80,8 +80,8 @@ export function DeviceVerificationScreen({
     triggerHaptic('success');
     const rawUserCleanId = String(user.telegramId || user.id || '').trim();
     const appUrl = referrerId
-      ? `${MINI_APP_URL}?start=ref_${referrerId.replace('ref_', '')}`
-      : MINI_APP_URL;
+      ? `${MINI_APP_URL}?uid=${rawUserCleanId}&start=ref_${referrerId.replace('ref_', '')}`
+      : `${MINI_APP_URL}?uid=${rawUserCleanId}`;
 
     // 1. Mark verified in Local Storage and Firebase RTDB while ensuring 1 Sign Up Scratch Card is intact
     const initialSpins =
@@ -92,26 +92,31 @@ export function DeviceVerificationScreen({
         : 0;
     const initialSpinsEarned = Math.max(user.spinsEarned || 0, 1);
 
-    saveSingleUser({
-      ...user,
+    const verifiedPatch = {
       spins: initialSpins,
       spinsEarned: initialSpinsEarned,
       claimedWelcomeSpin: true,
       isVerified: true,
       deviceVerified: true,
       deviceVerifiedAt: Date.now(),
+    };
+
+    saveSingleUser({
+      ...user,
+      ...verifiedPatch,
     });
+
+    if (rawUserCleanId) {
+      fetch(`${RTDB_BASE_URL}/users/${rawUserCleanId}.json`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(verifiedPatch),
+      }).catch(() => {});
+    }
 
     if (rtdb && rawUserCleanId) {
       try {
-        await update(ref(rtdb, `users/${rawUserCleanId}`), {
-          spins: initialSpins,
-          spinsEarned: initialSpinsEarned,
-          claimedWelcomeSpin: true,
-          isVerified: true,
-          deviceVerified: true,
-          deviceVerifiedAt: Date.now(),
-        });
+        await update(ref(rtdb, `users/${rawUserCleanId}`), verifiedPatch);
       } catch (e) {
         console.warn('Error updating verified status in RTDB:', e);
       }
@@ -125,6 +130,7 @@ export function DeviceVerificationScreen({
           '✅': '5206607081334906820',
           '🎁': '5312315739842026355',
           '🎉': '5312486361243062266',
+          '😍': '5312513303690351633',
           '👥': '5312424912994963580',
         };
         try {
@@ -142,20 +148,20 @@ export function DeviceVerificationScreen({
         const pe = (ch: string) =>
           emojiMap[ch] ? `<tg-emoji emoji-id="${emojiMap[ch]}">${ch}</tg-emoji>` : ch;
 
-        const premiumText = `${pe('🔥')}<b>Congratulations Sussefuly Verfied</b> ${pe('✅')}\n${pe('🎁')} <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n${pe('🎉')} <b>Click To Home And Refer And Earn</b> ${pe('🎉')}\n${pe('✅')}${pe('✅')}<b>Now All Payment Instant</b> ${pe('✅')}${pe('✅')}`;
+        const premiumText = `${pe('🔥')}<b>Congratulations Sussefuly Verfied ${pe('✅')}</b>\n\n${pe('🎉')} <b>Click To Home And Refer And Earn ${pe('🎉')}</b>\n\n${pe('😍')}${pe('😍')}<b>Now All Payment Instant ${pe('😍')}${pe('😍')}</b>`;
 
         const premiumMarkup = {
           inline_keyboard: [
             [
               {
-                text: '🎉 Click To Home (Win Up to ₹50)',
+                text: '🎉 Click To Home',
                 icon_custom_emoji_id: emojiMap['🎉'],
                 web_app: { url: appUrl },
               },
             ],
             [
               {
-                text: '👥 Refer And Earn (1 Refer = 1 Scratch)',
+                text: '👥 Refer And Earn',
                 icon_custom_emoji_id: emojiMap['👥'],
                 callback_data: 'my_invite',
               },
@@ -178,8 +184,8 @@ export function DeviceVerificationScreen({
           // Fallback without button icon_custom_emoji_id while preserving <tg-emoji> in text
           const fallbackMarkup = {
             inline_keyboard: [
-              [{ text: '🎉 Click To Home (Win Up to ₹50)', web_app: { url: appUrl } }],
-              [{ text: '👥 Refer And Earn (1 Refer = 1 Scratch)', callback_data: 'my_invite' }],
+              [{ text: '🎉 Click To Home', web_app: { url: appUrl } }],
+              [{ text: '👥 Refer And Earn', callback_data: 'my_invite' }],
             ],
           };
           const res2 = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -194,7 +200,7 @@ export function DeviceVerificationScreen({
           });
           const data2 = await res2.json().catch(() => ({ ok: false }));
           if (!data2?.ok) {
-            const plainText = `🔥<b>Congratulations Sussefuly Verfied</b> ✅\n🎁 <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n🎉 <b>Click To Home And Refer And Earn</b> 🎉\n✅✅<b>Now All Payment Instant</b> ✅✅`;
+            const plainText = `🔥<b>Congratulations Sussefuly Verfied ✅</b>\n\n🎉 <b>Click To Home And Refer And Earn 🎉</b>\n\n😍😍<b>Now All Payment Instant 😍😍</b>`;
             await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },

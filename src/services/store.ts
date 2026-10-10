@@ -701,6 +701,18 @@ export function markUserIdBlockedLocally(userId?: string | null): void {
   localStorage.setItem(`rg_blocked_uid_${cleanId}`, 'true');
 }
 
+export function hasUserPlayedScratchLocally(userId: string): boolean {
+  const cleanId = String(userId).trim();
+  if (!cleanId) return false;
+  if (typeof window !== 'undefined' && localStorage.getItem(`rg_user_played_first_scratch_${cleanId}`) === 'true') {
+    return true;
+  }
+  const txs = getAllTransactions();
+  return txs.some(
+    (t) => String(t.userId).trim() === cleanId && t.type === 'spin_win'
+  );
+}
+
 export async function syncUserWithRemote(userId: string): Promise<UserProfile | null> {
   try {
     const cleanId = String(userId).trim();
@@ -715,16 +727,31 @@ export async function syncUserWithRemote(userId: string): Promise<UserProfile | 
         remoteUser.id = String(remoteUser.id || cleanId).trim();
         remoteUser.telegramId = String(remoteUser.telegramId || cleanId).trim();
 
-        // Ensure signup bonus of 1 scratch card is granted if remote record was created partially (e.g. only referredBy)
-        const hasPlayedAnySpin = (remoteUser.balance || 0) > 0 || remoteUser.claimedWelcomeSpin === true;
-        if (!hasPlayedAnySpin && typeof remoteUser.spins !== 'number') {
+        const playedAlready =
+          Number(remoteUser.balance || 0) > 0 ||
+          remoteUser.referralRewardGiven === true ||
+          remoteUser.hasScratchedFirstCard === true ||
+          hasUserPlayedScratchLocally(cleanId);
+
+        // Guarantee 1 Sign Up Scratch Card if user has never scratched yet (balance === 0 and not played)
+        let needsRemotePatch = false;
+        if (!playedAlready && (typeof remoteUser.spins !== 'number' || remoteUser.spins < 1)) {
           remoteUser.spins = 1;
-          remoteUser.spinsEarned = Math.max(remoteUser.spinsEarned || 0, 1);
+          remoteUser.spinsEarned = Math.max(Number(remoteUser.spinsEarned) || 0, 1);
           remoteUser.claimedWelcomeSpin = true;
-        } else if (remoteUser.claimedWelcomeSpin === false && (remoteUser.balance || 0) === 0 && (remoteUser.spins || 0) === 0) {
-          remoteUser.spins = 1;
-          remoteUser.spinsEarned = Math.max(remoteUser.spinsEarned || 0, 1);
-          remoteUser.claimedWelcomeSpin = true;
+          needsRemotePatch = true;
+        }
+
+        if (needsRemotePatch) {
+          fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              spins: remoteUser.spins,
+              spinsEarned: remoteUser.spinsEarned,
+              claimedWelcomeSpin: true,
+            }),
+          }).catch(() => {});
         }
 
         const users = getAllUsers();
@@ -760,36 +787,31 @@ export function getCurrentUser(): UserProfile {
   const users = getAllUsers();
   const tgUser = getTelegramUser();
 
-  // If inside Telegram, use real telegram user ID
+  // If inside Telegram or URL has ?uid=, use real telegram user ID
   let effectiveId: string;
   if (tgUser && tgUser.id) {
-    effectiveId = String(tgUser.id);
+    effectiveId = String(tgUser.id).trim();
     if (typeof window !== 'undefined') {
       localStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, effectiveId);
     }
   } else {
     const stored = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEYS.CURRENT_USER_ID) : null;
-    if (stored) {
+    if (stored && stored !== '88491204') {
       effectiveId = stored;
     } else {
-      // If this is the initial launch and no users exist, default to 88491204
-      if (users.length === 0 || (users.length === 1 && users[0].id === '88491204')) {
-        effectiveId = '88491204';
-      } else {
-        // Generate unique persistent visitor ID so external visitors don't conflict
-        effectiveId = String(Math.floor(10000000 + Math.random() * 90000000));
-      }
+      // Generate unique persistent visitor ID so external visitors NEVER share balance/referrals
+      effectiveId = String(Math.floor(100000000 + Math.random() * 900000000));
       if (typeof window !== 'undefined') {
         localStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, effectiveId);
       }
     }
   }
 
-  let user = users.find(u => u.id === effectiveId || u.telegramId === effectiveId);
+  let user = users.find(u => String(u.id).trim() === effectiveId || String(u.telegramId).trim() === effectiveId);
   const isLocallyBlockedUid = isUserIdBlockedLocally(effectiveId);
 
   if (!user) {
-    // Auto register user with ₹0 balance and 1 free signup scratch card
+    // Auto register user with strictly ₹0 balance and 1 free signup scratch card
     const newUser: UserProfile = {
       id: effectiveId,
       telegramId: effectiveId,
@@ -826,7 +848,7 @@ export function getCurrentUser(): UserProfile {
     if (tgUser) {
       const freshName = `${tgUser.first_name}${tgUser.last_name ? ' ' + tgUser.last_name : ''}`.trim();
       let hasUpdates = false;
-      if (freshName && user.name !== freshName) {
+      if (freshName && !freshName.startsWith('User #') && user.name !== freshName) {
         user.name = freshName;
         hasUpdates = true;
       }
@@ -843,19 +865,18 @@ export function getCurrentUser(): UserProfile {
       }
     }
 
-    if (!user.claimedWelcomeSpin && (user.balance || 0) === 0) {
-      // One-time upgrade: Grant the 1 Sign Up Bonus scratch card if not yet marked and user hasn't played yet
+    const playedAlready =
+      Number(user.balance || 0) > 0 ||
+      user.referralRewardGiven === true ||
+      (user as any).hasScratchedFirstCard === true ||
+      hasUserPlayedScratchLocally(effectiveId);
+
+    if (!playedAlready && (typeof user.spins !== 'number' || user.spins < 1)) {
+      // Guarantee 1 Sign Up Bonus scratch card if user hasn't played any scratch card yet
       user.claimedWelcomeSpin = true;
-      user.spins = Math.max(user.spins || 0, 1);
+      user.spins = 1;
       user.spinsEarned = Math.max(user.spinsEarned || 0, 1);
-      saveUsers(users);
-      addTransaction({
-        userId: user.id,
-        type: 'welcome_bonus',
-        amount: 0,
-        description: 'Sign Up Bonus: 1 Free Scratch Card',
-        status: 'completed',
-      });
+      saveSingleUser(user);
     }
   }
 
@@ -960,6 +981,10 @@ export function decrementUserSpin(userId: string): boolean {
   if (!user || user.spins <= 0) return false;
 
   user.spins -= 1;
+  (user as any).hasScratchedFirstCard = true;
+  if (typeof window !== 'undefined') {
+    localStorage.setItem(`rg_user_played_first_scratch_${cleanId}`, 'true');
+  }
   saveSingleUser(user);
   return true;
 }
@@ -1891,6 +1916,7 @@ export async function creditReferralAfterFirstSpin(currentUserId: string): Promi
   const completedJoinerPatch = {
     referredBy,
     referralRewardGiven: true,
+    hasScratchedFirstCard: true,
     referralCompletedAt: Date.now(),
   };
 
@@ -1904,7 +1930,7 @@ export async function creditReferralAfterFirstSpin(currentUserId: string): Promi
     update(ref(rtdb, `users/${cleanCurrentId}`), completedJoinerPatch).catch(() => {});
   }
 
-  // Award +1 Spin & +1 Friend to the Referrer in Firebase RTDB (via REST + SDK)
+  // Award strictly +1 Scratch Card & +1 Friend to the Referrer in Firebase RTDB (NEVER direct cash!)
   let referrerSpins = 2;
   try {
     let refVal: any = null;
@@ -2027,19 +2053,19 @@ export async function creditReferralAfterFirstSpin(currentUserId: string): Promi
       if (rtdb) {
         await set(ref(rtdb, `referrals/${referredBy}/${cleanCurrentId}`), refLogPayload).catch(() => {});
       }
+
+      // Also update referrer in local users array ONLY when not already counted
+      const allCurrentUsers = getAllUsers();
+      const localRefUser = allCurrentUsers.find(u => String(u.id).trim() === referredBy || String(u.telegramId).trim() === referredBy);
+      if (localRefUser) {
+        localRefUser.spins = referrerSpins;
+        localRefUser.friendsJoined = (localRefUser.friendsJoined || 0) + 1;
+        localRefUser.spinsEarned = (localRefUser.spinsEarned || 0) + 1;
+        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(allCurrentUsers));
+      }
     }
   } catch (e) {
     console.warn('Error crediting referrer in RTDB:', e);
-  }
-
-  // Also update referrer in local users array if present
-  const allCurrentUsers = getAllUsers();
-  const localRefUser = allCurrentUsers.find(u => u.id === referredBy || u.telegramId === referredBy);
-  if (localRefUser) {
-    localRefUser.spins = (localRefUser.spins || 0) + 1;
-    localRefUser.friendsJoined = (localRefUser.friendsJoined || 0) + 1;
-    localRefUser.spinsEarned = (localRefUser.spinsEarned || 0) + 1;
-    saveUsers(allCurrentUsers);
   }
 
   // Send Telegram Notification to Referrer ONLY after friend completes 1st scratch (with Premium Animated Emojis)
@@ -2125,24 +2151,96 @@ export interface UserReferralEntry {
   status?: string;
 }
 
+/**
+ * Strips any trailing "(7858573555)" or "(@username)" from a referral name
+ * so the same friend never appears twice (once with @username and once with numeric ID).
+ */
+function cleanReferralDisplayName(rawName?: string, fallbackId?: string): string {
+  if (!rawName) {
+    return fallbackId ? `User #${String(fallbackId).slice(-4)}` : 'Friend';
+  }
+  const stripped = rawName
+    .replace(/\s*\(\d+\)\s*$/g, '')
+    .replace(/\s*\(@[^)]+\)\s*$/g, '')
+    .trim();
+  return stripped || (fallbackId ? `User #${String(fallbackId).slice(-4)}` : 'Friend');
+}
+
+function deduplicateReferralEntries(entries: UserReferralEntry[], limit = 10): UserReferralEntry[] {
+  const byJoinerKey = new Map<string, UserReferralEntry>();
+
+  for (const item of entries) {
+    const cleanName = cleanReferralDisplayName(item.name, item.joinerId);
+    const normalizedItem: UserReferralEntry = {
+      ...item,
+      name: cleanName,
+      username: item.username && !/^\d+$/.test(item.username) ? item.username.replace(/^@/, '') : undefined,
+    };
+
+    const jidKey = item.joinerId ? `id_${String(item.joinerId).trim()}` : '';
+    const nameKey = `name_${cleanName.toLowerCase()}`;
+
+    // Check if already exists by joinerId OR by identical display name within the referral list
+    let existingKey: string | null = null;
+    if (jidKey && byJoinerKey.has(jidKey)) {
+      existingKey = jidKey;
+    } else {
+      for (const [k, v] of byJoinerKey.entries()) {
+        if (
+          (jidKey && v.joinerId && `id_${String(v.joinerId).trim()}` === jidKey) ||
+          v.name.toLowerCase() === cleanName.toLowerCase()
+        ) {
+          existingKey = k;
+          break;
+        }
+      }
+    }
+
+    if (!existingKey) {
+      byJoinerKey.set(jidKey || nameKey, normalizedItem);
+    } else {
+      const prev = byJoinerKey.get(existingKey)!;
+      // Merge: prefer rewardGiven = true, real username (not auto user_xxxx if real exists), and latest timestamp
+      const bestUsername =
+        prev.username && !prev.username.startsWith('user_')
+          ? prev.username
+          : normalizedItem.username || prev.username;
+      const merged: UserReferralEntry = {
+        ...prev,
+        joinerId: prev.joinerId || normalizedItem.joinerId,
+        name: prev.name.startsWith('User #') && !normalizedItem.name.startsWith('User #') ? normalizedItem.name : prev.name,
+        username: bestUsername,
+        rewardGiven: prev.rewardGiven || normalizedItem.rewardGiven,
+        status: prev.rewardGiven || normalizedItem.rewardGiven ? 'completed_first_spin' : prev.status || normalizedItem.status,
+        createdAt: Math.max(prev.createdAt || 0, normalizedItem.createdAt || 0),
+      };
+      byJoinerKey.set(existingKey, merged);
+    }
+  }
+
+  const result = Array.from(byJoinerKey.values());
+  result.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return result.slice(0, limit);
+}
+
 export function getUserLastReferrals(userId: string, limit = 10): UserReferralEntry[] {
   const cleanId = String(userId).trim();
   if (!cleanId) return [];
 
   const entries: UserReferralEntry[] = [];
-  const seenJoinerIds = new Set<string>();
 
   // 1. Check all users who have referredBy === cleanId
   const allUsers = getAllUsers();
   for (const u of allUsers) {
     if (u.referredBy && String(u.referredBy).trim() === cleanId) {
-      seenJoinerIds.add(String(u.id).trim());
+      const jid = String(u.id).trim();
+      const cName = cleanReferralDisplayName(u.name, jid);
       entries.push({
-        id: `ref_user_${u.id}`,
-        joinerId: u.id,
-        name: u.name || `User #${u.id.slice(-4)}`,
+        id: `ref_user_${jid}`,
+        joinerId: jid,
+        name: cName,
         username: u.username,
-        description: `${u.name || `User #${u.id}`} (@${u.username || 'user'})`,
+        description: cName,
         createdAt: u.referralCompletedAt || u.createdAt || Date.now(),
         rewardGiven: Boolean(u.referralRewardGiven),
         status: u.referralRewardGiven ? 'completed_first_spin' : 'pending_first_scratch',
@@ -2150,31 +2248,34 @@ export function getUserLastReferrals(userId: string, limit = 10): UserReferralEn
     }
   }
 
-  // 2. Also include referral_bonus transactions for this user
+  // 2. Also include referral_bonus transactions for this user (extracting joinerId from "(7858573555)" if present)
   const refTxs = getReferralTransactions(cleanId);
   for (const tx of refTxs) {
-    const alreadyMatched = Array.from(seenJoinerIds).some(
-      (jid) => tx.description.includes(jid)
-    );
-    if (!alreadyMatched) {
-      entries.push({
-        id: tx.id,
-        name: tx.description.replace(/^Friend\s+/i, '').replace(/\s+(completed|joined).*$/i, '') || 'Referred Friend',
-        description: tx.description,
-        createdAt: tx.createdAt || Date.now(),
-        rewardGiven: true,
-        status: 'completed_first_spin',
-      });
-    }
+    const idMatch = tx.description.match(/\((\d+)\)/) || tx.id.match(/_ref_(\d+)$/);
+    const extractedJoinerId = idMatch ? idMatch[1] : undefined;
+    const rawExtractedName = tx.description
+      .replace(/^Friend\s+/i, '')
+      .replace(/\s+(completed|joined).*$/i, '')
+      .trim();
+    const cName = cleanReferralDisplayName(rawExtractedName, extractedJoinerId);
+
+    entries.push({
+      id: tx.id,
+      joinerId: extractedJoinerId,
+      name: cName,
+      description: tx.description,
+      createdAt: tx.createdAt || Date.now(),
+      rewardGiven: true,
+      status: 'completed_first_spin',
+    });
   }
 
-  entries.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-  return entries.slice(0, limit);
+  return deduplicateReferralEntries(entries, limit);
 }
 
 /**
  * Fetches a specific user's last 10 referrals directly from Firebase RTDB (`referrals/{userId}`)
- * so we don't need to load all users in the database to see a user's referrals.
+ * and merges with local entries with strict deduplication so every friend is shown ONLY ONCE!
  */
 export async function fetchUserLastReferralsFromRemote(
   userId: string,
@@ -2196,29 +2297,20 @@ export async function fetchUserLastReferralsFromRemote(
         for (const [key, val] of Object.entries(data as Record<string, any>)) {
           if (val && typeof val === 'object') {
             const jid = String(val.joinerId || key).trim();
+            const cName = cleanReferralDisplayName(val.name, jid);
             remoteEntries.push({
               id: `rtdb_ref_${jid}`,
               joinerId: jid,
-              name: val.name || `User #${jid.slice(-4)}`,
+              name: cName,
               username: val.username,
-              description: `${val.name || `User #${jid}`}`,
+              description: cName,
               createdAt: Number(val.timestamp || val.createdAt || Date.now()),
               rewardGiven: val.status === 'completed_first_spin' || val.rewardGiven === true,
               status: val.status || (val.rewardGiven ? 'completed_first_spin' : 'pending_first_scratch'),
             });
           }
         }
-        // Merge remote and local without duplicates
-        const mergedMap = new Map<string, UserReferralEntry>();
-        for (const item of [...remoteEntries, ...localEntries]) {
-          const dedupKey = item.joinerId || item.id;
-          if (!mergedMap.has(dedupKey)) {
-            mergedMap.set(dedupKey, item);
-          }
-        }
-        const combined = Array.from(mergedMap.values());
-        combined.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-        return combined.slice(0, limit);
+        return deduplicateReferralEntries([...remoteEntries, ...localEntries], limit);
       }
     }
   } catch (err) {

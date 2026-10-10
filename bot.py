@@ -356,6 +356,8 @@ _PREMIUM_EMOJI_MAP = {
     "👑": "5312322066328853156",
     "🎉": "5312486361243062266",
     "🎁": "5312315739842026355",
+    "🛫": "5312409003186199286",
+    "🚨": "5312526098985124879",
     "🌺": "5312138559556164615",
     "😍": "5312513303690351633",
     "🍑": "5312383351024260855",
@@ -423,6 +425,8 @@ def init_premium_emojis():
                 ("🔥", ["🔥", "⚡", "💥"]),
                 ("🎉", ["🎉", "🥳", "🎊", "✨"]),
                 ("🎁", ["🎁", "💎", "🏆", "💰"]),
+                ("🛫", ["🛫", "✈️", "🚀", "⚡"]),
+                ("🚨", ["🚨", "🔔", "❗", "⚠️", "🔥"]),
                 ("🌺", ["🌺", "🌸", "🌷", "🌹", "🌻", "🍀"]),
                 ("😍", ["😍", "❤️", "💖", "🥰", "🤩"]),
                 ("🍑", ["🍑", "🍓", "🍒", "🍎", "🔥"]),
@@ -530,9 +534,9 @@ def is_owner(user: dict) -> bool:
 def build_channels_keyboard(channels: list[dict], ref_param: str = None) -> dict:
     buttons = []
     for i in range(0, len(channels), 2):
-        row = [pbtn("✔ Join", emoji_char="✅", url=channels[i]["url"])]
+        row = [pbtn("Join 🛫", emoji_char="🛫", url=channels[i]["url"])]
         if i + 1 < len(channels):
-            row.append(pbtn("✔ Join", emoji_char="✅", url=channels[i + 1]["url"]))
+            row.append(pbtn("Join 🛫", emoji_char="🛫", url=channels[i + 1]["url"]))
         buttons.append(row)
 
     claim_callback = f"claim_{ref_param or 'none'}"
@@ -628,10 +632,15 @@ def handle_start(chat_id, user: dict, args: list[str]):
         existing = welcome_user
     else:
         patch_data = {}
-        # If user record was created partially without signup scratch card and hasn't played yet, grant 1 scratch card
-        if not existing.get("claimedWelcomeSpin") and (existing.get("balance") or 0) == 0 and (existing.get("spins") is None or existing.get("spins") == 0):
+        # Guarantee 1 signup scratch card for any new/referred user who hasn't scratched their 1st card yet
+        has_played_first = bool(
+            (existing.get("balance") or 0) > 0
+            or existing.get("hasScratchedFirstCard") is True
+            or existing.get("referralRewardGiven") is True
+        )
+        if not has_played_first and (existing.get("spins") is None or int(existing.get("spins") or 0) < 1):
             patch_data["spins"] = 1
-            patch_data["spinsEarned"] = max(existing.get("spinsEarned") or 0, 1)
+            patch_data["spinsEarned"] = max(int(existing.get("spinsEarned") or 0), 1)
             patch_data["claimedWelcomeSpin"] = True
             existing["spins"] = 1
             existing["spinsEarned"] = patch_data["spinsEarned"]
@@ -664,26 +673,23 @@ def handle_start(chat_id, user: dict, args: list[str]):
         app_url = f"{WEB_URL}/?uid={user_id}&start=ref_{referrer_id}" if referrer_id else f"{WEB_URL}/?uid={user_id}"
         verified_markup = {
             "inline_keyboard": [
-                [pbtn("🎉 Click To Home (Win Up to ₹50)", emoji_char="🎉", web_app={"url": app_url})],
-                [pbtn("👥 Refer And Earn (1 Refer = 1 Scratch)", emoji_char="👥", callback_data="my_invite")],
+                [pbtn("🎉 Click To Home", emoji_char="🎉", web_app={"url": app_url})],
+                [pbtn("👥 Refer And Earn", emoji_char="👥", callback_data="my_invite")],
             ]
         }
         verified_text = (
-            f"{pe('🔥')}<b>Congratulations Sussefuly Verfied</b> {pe('✅')}\n"
-            f"{pe('🎁')} <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n"
-            f"{pe('🎉')} <b>Click To Home And Refer And Earn</b> {pe('🎉')}\n"
-            f"{pe('✅')}{pe('✅')}<b>Now All Payment Instant</b> {pe('✅')}{pe('✅')}"
+            f"{pe('🔥')}<b>Congratulations Sussefuly Verfied {pe('✅')}</b>\n\n"
+            f"{pe('🎉')} <b>Click To Home And Refer And Earn {pe('🎉')}</b>\n\n"
+            f"{pe('😍')}{pe('😍')}<b>Now All Payment Instant {pe('😍')}{pe('😍')}</b>"
         )
         send_message_smart(chat_id, verified_text, reply_markup=verified_markup)
         return
 
     channels = load_channels()
     welcome_text = (
-        f"{pe('👑')} <b>Hey There! Welcome To Scratch The Win !!</b>\n"
-        f"{pe('🎁')} <b>1 Sign Up = 1 Free Scratch Card (Win Up to ₹50)</b>\n"
-        f"{pe('👥')} <b>1 Refer = 1 Free Scratch Card</b>\n\n"
-        f"{pe('🌺')} <b>Join The Channels Below To Continue</b>\n\n"
-        f"{pe('😍')} <b>After Joining Click Claim</b>"
+        f"{pe('🎁')} <b>Hey  Welcome To Scratch The Win !!</b>\n\n"
+        f"{pe('🛫')} <b>Join  Channels Below To Continue{pe('🛫')}</b>\n\n"
+        f"{pe('😍')} <b>After Joining Click Claim{pe('🚨')}</b>"
     )
     markup = build_channels_keyboard(channels, ref_param)
     send_message_smart(chat_id, welcome_text, reply_markup=markup)
@@ -717,14 +723,14 @@ def handle_claim_callback(query: dict):
 
     step2_markup = {
         "inline_keyboard": [
-            [pbtn("🍑 Please Click Verify Device ✅", emoji_char="🍑", web_app={"url": verify_url})],
+            [pbtn("🍑 Please Click Verify Device 🎉", emoji_char="🍑", web_app={"url": verify_url})],
             [pbtn("🔄 Check Status", emoji_char="🔄", callback_data=f"check_device_{ref_param or 'none'}")],
         ]
     }
     step2_text = (
-        f"<b>All Channel Verfied Done {pe('✅')}{pe('👌')}</b>\n"
-        f"{pe('⚠️')}<b>Step 2:- Device verification</b>\n"
-        f"{pe('🍑')} <b>Please Click Verify Device {pe('✅')}</b>"
+        f"{pe('🎁')}<b>All Channel Verfied Done {pe('🔥')}{pe('👌')}</b>\n\n"
+        f"{pe('⚠️')}<b>Step 2:- Device verification</b> \n\n"
+        f"{pe('🍑')} <b>Please Click Verify Device {pe('🎉')}</b>"
     )
     edit_message_text_smart(chat_id, message_id, step2_text, reply_markup=step2_markup)
 
@@ -767,15 +773,14 @@ def handle_check_device_callback(query: dict):
     app_url = f"{WEB_URL}/?uid={user_id}&start={ref_param}" if ref_param else f"{WEB_URL}/?uid={user_id}"
     final_markup = {
         "inline_keyboard": [
-            [pbtn("🎉 Click To Home (Win Up to ₹50)", emoji_char="🎉", web_app={"url": app_url})],
-            [pbtn("👥 Refer And Earn (1 Refer = 1 Scratch)", emoji_char="👥", callback_data="my_invite")],
+            [pbtn("🎉 Click To Home", emoji_char="🎉", web_app={"url": app_url})],
+            [pbtn("👥 Refer And Earn", emoji_char="👥", callback_data="my_invite")],
         ]
     }
     final_text = (
-        f"{pe('🔥')}<b>Congratulations Sussefuly Verfied</b> {pe('✅')}\n"
-        f"{pe('🎁')} <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n"
-        f"{pe('🎉')} <b>Click To Home And Refer And Earn</b> {pe('🎉')}\n"
-        f"{pe('✅')}{pe('✅')}<b>Now All Payment Instant</b> {pe('✅')}{pe('✅')}"
+        f"{pe('🔥')}<b>Congratulations Sussefuly Verfied {pe('✅')}</b>\n\n"
+        f"{pe('🎉')} <b>Click To Home And Refer And Earn {pe('🎉')}</b>\n\n"
+        f"{pe('😍')}{pe('😍')}<b>Now All Payment Instant {pe('😍')}{pe('😍')}</b>"
     )
     edit_message_text_smart(chat_id, message_id, final_text, reply_markup=final_markup)
 

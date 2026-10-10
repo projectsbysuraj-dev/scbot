@@ -1260,112 +1260,151 @@ export async function fetchUsersBatchFromRemote(
   return { users: fallback, nextCursor: null, hasMore: fallback.length > batchSize };
 }
 
+const activeWithdrawalLocks = new Set<string>();
+const activeReferralLocks = new Set<string>();
+
 export async function requestWithdrawal(
   req: Omit<WithdrawalRequest, 'id' | 'status' | 'createdAt'>
 ): Promise<{ success: boolean; error?: string; request?: WithdrawalRequest }> {
   const settings = getStoredSettings();
   const users = getAllUsers();
   const cleanUserId = String(req.userId).trim();
-  const u = users.find(x => String(x.id).trim() === cleanUserId || String(x.telegramId).trim() === cleanUserId) || getCurrentUser();
-
-  const numAmount = Number(req.amount);
-  if (isNaN(numAmount) || !isFinite(numAmount) || numAmount <= 0) {
-    return { success: false, error: 'Invalid withdrawal amount' };
+  if (!cleanUserId) {
+    return { success: false, error: 'Invalid user account' };
   }
 
-  if (numAmount < settings.minWithdrawalLimit) {
-    return { success: false, error: `Minimum withdrawal amount is ₹${settings.minWithdrawalLimit}` };
+  if (activeWithdrawalLocks.has(cleanUserId)) {
+    return { success: false, error: 'Withdrawal is being processed! Please wait a moment.' };
   }
 
-  if (u.balance < numAmount) {
-    return { success: false, error: `Insufficient balance! Available balance is ₹${u.balance.toFixed(2)}` };
-  }
-
-  // Prevent double-click rapid race conditions
-  const allWithdrawals = getAllWithdrawals();
-  const recentDuplicate = allWithdrawals.find(
-    (w) => w.userId === u.id && w.status === 'pending' && Math.abs(w.amount - numAmount) < 0.01 && Date.now() - (w.createdAt || 0) < 6000
-  );
-  if (recentDuplicate) {
-    return { success: false, error: 'Withdrawal already submitted! Please wait a moment.' };
-  }
-
-  // Deduct balance immediately and commit to Firebase RTDB before creating withdrawal record
-  u.balance = Number(Math.max(0, u.balance - numAmount).toFixed(2));
-  saveSingleUser(u);
+  activeWithdrawalLocks.add(cleanUserId);
   try {
-    await fetch(`${RTDB_BASE_URL}/users/${u.id}.json`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(sanitizeForFirebase(u)),
-    });
-  } catch {
-    // Ignore network hiccup
-  }
+    const u = users.find(x => String(x.id).trim() === cleanUserId || String(x.telegramId).trim() === cleanUserId) || getCurrentUser();
 
-  const withdrawalId = `w_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
-
-  // Construct clean withdrawal object without ANY undefined fields
-  const rawWithdrawal: WithdrawalRequest = {
-    id: withdrawalId,
-    userId: u.id,
-    userName: req.userName || u.name || 'Telegram User',
-    amount: numAmount,
-    method: req.method,
-    status: 'pending',
-    createdAt: Date.now(),
-  };
-
-  if (req.method === 'upi' && req.upiId) {
-    rawWithdrawal.upiId = req.upiId.trim();
-  } else if (req.method === 'bank') {
-    if (req.accountHolder) rawWithdrawal.accountHolder = req.accountHolder.trim();
-    if (req.accountNumber) rawWithdrawal.accountNumber = req.accountNumber.trim();
-    if (req.bankName) rawWithdrawal.bankName = req.bankName.trim();
-    if (req.ifsc) rawWithdrawal.ifsc = req.ifsc.trim().toUpperCase();
-  }
-
-  const cleanWithdrawal = sanitizeForFirebase(rawWithdrawal);
-
-  // Update local storage first
-  const all = getAllWithdrawals();
-  all.unshift(cleanWithdrawal);
-  saveWithdrawals(all);
-
-  // 1. Direct REST PUT to ensure guaranteed real-time arrival in Firebase RTDB
-  try {
-    await fetch(`${RTDB_BASE_URL}/withdrawals/${cleanWithdrawal.id}.json`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(cleanWithdrawal),
-    });
-  } catch (err) {
-    console.warn('Direct HTTP PUT error:', err);
-  }
-
-  // 2. Push to Firebase SDK if active
-  if (rtdb) {
-    try {
-      set(ref(rtdb, `withdrawals/${cleanWithdrawal.id}`), cleanWithdrawal).catch((e) => {
-        console.warn('Firebase withdrawal create notice:', e);
-      });
-    } catch (e) {
-      console.warn('Firebase SDK set exception caught safely:', e);
+    if (u.deviceBlocked || isUserIdBlockedLocally(cleanUserId)) {
+      return { success: false, error: 'Device verification failed / Account blocked.' };
     }
+
+    const numAmount = Number(req.amount);
+    if (isNaN(numAmount) || !isFinite(numAmount) || numAmount <= 0) {
+      return { success: false, error: 'Invalid withdrawal amount' };
+    }
+
+    if (numAmount < settings.minWithdrawalLimit) {
+      return { success: false, error: `Minimum withdrawal amount is ₹${settings.minWithdrawalLimit}` };
+    }
+
+    // Verify live remote balance in Firebase RTDB so DevTools localStorage balance edits cannot bypass checks
+    try {
+      const remResp = await fetch(`${RTDB_BASE_URL}/users/${cleanUserId}.json`, { cache: 'no-store' });
+      if (remResp.ok) {
+        const remUser = await remResp.json();
+        if (remUser && typeof remUser === 'object') {
+          if (remUser.deviceBlocked === true) {
+            markUserIdBlockedLocally(cleanUserId);
+            return { success: false, error: 'Account permanently blocked due to multi-account violation.' };
+          }
+          if (typeof remUser.balance === 'number') {
+            u.balance = Number(remUser.balance);
+          }
+        }
+      }
+    } catch {
+      // Fallback to local balance if offline
+    }
+
+    if (u.balance < numAmount) {
+      return { success: false, error: `Insufficient balance! Available balance is ₹${u.balance.toFixed(2)}` };
+    }
+
+    // Prevent double-click rapid race conditions
+    const allWithdrawals = getAllWithdrawals();
+    const recentDuplicate = allWithdrawals.find(
+      (w) => w.userId === u.id && w.status === 'pending' && Math.abs(w.amount - numAmount) < 0.01 && Date.now() - (w.createdAt || 0) < 6000
+    );
+    if (recentDuplicate) {
+      return { success: false, error: 'Withdrawal already submitted! Please wait a moment.' };
+    }
+
+    // Deduct balance immediately and commit to Firebase RTDB before creating withdrawal record
+    u.balance = Number(Math.max(0, u.balance - numAmount).toFixed(2));
+    saveSingleUser(u);
+    try {
+      await fetch(`${RTDB_BASE_URL}/users/${u.id}.json`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sanitizeForFirebase(u)),
+      });
+    } catch {
+      // Ignore network hiccup
+    }
+
+    const withdrawalId = `w_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
+
+    // Construct clean withdrawal object without ANY undefined fields
+    const rawWithdrawal: WithdrawalRequest = {
+      id: withdrawalId,
+      userId: u.id,
+      userName: req.userName || u.name || 'Telegram User',
+      amount: numAmount,
+      method: req.method,
+      status: 'pending',
+      createdAt: Date.now(),
+    };
+
+    if (req.method === 'upi' && req.upiId) {
+      rawWithdrawal.upiId = req.upiId.trim();
+    } else if (req.method === 'bank') {
+      if (req.accountHolder) rawWithdrawal.accountHolder = req.accountHolder.trim();
+      if (req.accountNumber) rawWithdrawal.accountNumber = req.accountNumber.trim();
+      if (req.bankName) rawWithdrawal.bankName = req.bankName.trim();
+      if (req.ifsc) rawWithdrawal.ifsc = req.ifsc.trim().toUpperCase();
+    }
+
+    const cleanWithdrawal = sanitizeForFirebase(rawWithdrawal);
+
+    // Update local storage first
+    const all = getAllWithdrawals();
+    all.unshift(cleanWithdrawal);
+    saveWithdrawals(all);
+
+    // 1. Direct REST PUT to ensure guaranteed real-time arrival in Firebase RTDB
+    try {
+      await fetch(`${RTDB_BASE_URL}/withdrawals/${cleanWithdrawal.id}.json`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cleanWithdrawal),
+      });
+    } catch (err) {
+      console.warn('Direct HTTP PUT error:', err);
+    }
+
+    // 2. Push to Firebase SDK if active
+    if (rtdb) {
+      try {
+        set(ref(rtdb, `withdrawals/${cleanWithdrawal.id}`), cleanWithdrawal).catch((e) => {
+          console.warn('Firebase withdrawal create notice:', e);
+        });
+      } catch (e) {
+        console.warn('Firebase SDK set exception caught safely:', e);
+      }
+    }
+
+    // Add transaction log
+    addTransaction({
+      userId: u.id,
+      type: 'withdrawal',
+      amount: -req.amount,
+      description: req.method === 'upi' ? `Withdrawal to UPI: ${cleanWithdrawal.upiId || 'N/A'}` : `Withdrawal to Bank: ${cleanWithdrawal.accountNumber || 'N/A'}`,
+      status: 'pending',
+    });
+
+    notifySubscribers('withdrawal_requested');
+
+    return { success: true, request: cleanWithdrawal };
+  } finally {
+    activeWithdrawalLocks.delete(cleanUserId);
   }
-
-  // Add transaction log
-  addTransaction({
-    userId: u.id,
-    type: 'withdrawal',
-    amount: -req.amount,
-    description: req.method === 'upi' ? `Withdrawal to UPI: ${cleanWithdrawal.upiId || 'N/A'}` : `Withdrawal to Bank: ${cleanWithdrawal.accountNumber || 'N/A'}`,
-    status: 'pending',
-  });
-
-  notifySubscribers('withdrawal_requested');
-
-  return { success: true, request: cleanWithdrawal };
 }
 
 export async function approveWithdrawal(withdrawalId: string): Promise<boolean> {
@@ -1715,8 +1754,8 @@ export function recordPendingReferral(referrerId: string, visitorId?: string): {
     .replace(/^invite_/i, '')
     .trim();
 
-  if (!cleanReferrerId) {
-    return { success: false, message: 'Empty referrer ID' };
+  if (!cleanReferrerId || !/^\d+$/.test(cleanReferrerId)) {
+    return { success: false, message: 'Invalid numeric referrer ID' };
   }
 
   const currentUserId = String(visitorId || getCurrentUser().id).trim();
@@ -1725,18 +1764,36 @@ export function recordPendingReferral(referrerId: string, visitorId?: string): {
     return { success: false, message: 'Self referral is not allowed' };
   }
 
-  // Prevent self-referral on same bound physical device
+  // Prevent self-referral or multi-account referral farming on same bound physical device
   const boundTelegramId = typeof window !== 'undefined' ? localStorage.getItem('rg_bound_telegram_id_v1') : null;
-  if (boundTelegramId && String(boundTelegramId).trim() === cleanReferrerId) {
-    return { success: false, message: 'Self referral on same device is not allowed' };
+  if (boundTelegramId) {
+    const cleanBound = String(boundTelegramId).trim();
+    if (cleanBound === cleanReferrerId || (cleanBound && cleanBound !== currentUserId)) {
+      return { success: false, message: 'Referral on already bound device is not allowed' };
+    }
   }
 
   const users = getAllUsers();
   const user = users.find(u => u.id === currentUserId || u.telegramId === currentUserId);
+  const refUserLocal = users.find(u => u.id === cleanReferrerId || u.telegramId === cleanReferrerId);
+
+  // Prevent circular referral (if currentUserId already referred cleanReferrerId, cleanReferrerId cannot refer currentUserId back)
+  if (refUserLocal && String(refUserLocal.referredBy || '').trim() === currentUserId) {
+    return { success: false, message: 'Circular referral is not allowed' };
+  }
   
-  // Existing users cannot be re-referred
+  // Existing users or blocked accounts cannot be referred
   if (user) {
-    if (user.referralRewardGiven || (user.claimedWelcomeSpin && (user.balance > 0 || user.friendsJoined > 0))) {
+    if (user.deviceBlocked || isUserIdBlockedLocally(currentUserId)) {
+      return { success: false, message: 'Blocked device cannot be referred' };
+    }
+    if (
+      user.referralRewardGiven ||
+      (user as any).hasScratchedFirstCard ||
+      hasUserPlayedScratchLocally(currentUserId) ||
+      user.balance > 0 ||
+      user.friendsJoined > 0
+    ) {
       return { success: false, message: 'Existing player cannot be referred' };
     }
     if (user.referredBy && user.referredBy !== cleanReferrerId) {
@@ -1820,151 +1877,182 @@ export function processReferralJoin(referrerId: string, visitorId?: string): { s
  */
 export async function creditReferralAfterFirstSpin(currentUserId: string): Promise<boolean> {
   const cleanCurrentId = String(currentUserId).trim();
-  if (!cleanCurrentId) return false;
+  if (!cleanCurrentId || activeReferralLocks.has(cleanCurrentId)) return false;
 
   const processedKey = `rg_ref_spin_awarded_${cleanCurrentId}`;
   if (typeof window !== 'undefined' && localStorage.getItem(processedKey)) {
     return false; // Already awarded for this user
   }
 
-  let referredBy: string | null = null;
-  let userName = 'Friend';
-  let userUsername = '';
-
-  // 1. Check local user profile
-  const users = getAllUsers();
-  const user = users.find(u => u.id === cleanCurrentId || u.telegramId === cleanCurrentId);
-  if (user) {
-    if (user.referralRewardGiven) {
-      if (typeof window !== 'undefined') localStorage.setItem(processedKey, 'true');
-      return false;
-    }
-    referredBy = user.referredBy || null;
-    userName = user.name || userName;
-    userUsername = user.username || userUsername;
+  // Block referral rewards from blocked or multi-account devices
+  if (isUserIdBlockedLocally(cleanCurrentId)) {
+    return false;
+  }
+  const boundTelegramId = typeof window !== 'undefined' ? localStorage.getItem('rg_bound_telegram_id_v1') : null;
+  if (boundTelegramId && String(boundTelegramId).trim() !== cleanCurrentId) {
+    return false;
   }
 
-  // 2. Check RTDB via REST first (most reliable across all networks/WebViews)
+  activeReferralLocks.add(cleanCurrentId);
+
   try {
-    const resp = await fetch(`${RTDB_BASE_URL}/users/${cleanCurrentId}.json`, { cache: 'no-store' });
-    if (resp.ok) {
-      const val = await resp.json();
-      if (val && typeof val === 'object') {
-        if (val.referralRewardGiven) {
-          if (typeof window !== 'undefined') localStorage.setItem(processedKey, 'true');
-          return false;
-        }
-        if (!referredBy && val.referredBy) {
-          referredBy = String(val.referredBy);
-        }
-        userName = val.name || userName;
-        userUsername = val.username || userUsername;
-      }
-    }
-  } catch {
-    // Fallback to SDK below
-  }
+    let referredBy: string | null = null;
+    let userName = 'Friend';
+    let userUsername = '';
 
-  if (!referredBy && rtdb && cleanCurrentId) {
+    // 1. Check local user profile
+    const users = getAllUsers();
+    const user = users.find(u => u.id === cleanCurrentId || u.telegramId === cleanCurrentId);
+    if (user) {
+      if (user.deviceBlocked) return false;
+      if (user.referralRewardGiven) {
+        if (typeof window !== 'undefined') localStorage.setItem(processedKey, 'true');
+        return false;
+      }
+      referredBy = user.referredBy || null;
+      userName = user.name || userName;
+      userUsername = user.username || userUsername;
+    }
+
+    // 2. Check RTDB via REST first (most reliable across all networks/WebViews)
     try {
-      const snap = await get(ref(rtdb, `users/${cleanCurrentId}`));
-      if (snap.exists()) {
-        const val = snap.val();
-        if (val.referralRewardGiven) {
-          if (typeof window !== 'undefined') localStorage.setItem(processedKey, 'true');
-          return false;
-        }
-        if (!referredBy && val.referredBy) {
-          referredBy = val.referredBy;
-        }
-        userName = val.name || userName;
-        userUsername = val.username || userUsername;
-      }
-    } catch (e) {
-      console.warn('Notice checking RTDB for referrer:', e);
-    }
-  }
-
-  // 3. Check localStorage fallback & URL start param
-  if (!referredBy && typeof window !== 'undefined') {
-    referredBy =
-      localStorage.getItem('rg_pending_referrer_id') ||
-      sessionStorage.getItem('rg_pending_ref_code') ||
-      new URLSearchParams(window.location.search).get('start');
-  }
-
-  if (!referredBy) return false;
-
-  referredBy = String(referredBy)
-    .replace(/^ref_/i, '')
-    .replace(/^ref-/i, '')
-    .replace(/^ref/i, '')
-    .trim();
-
-  if (!referredBy || referredBy === cleanCurrentId) return false;
-
-  // Mark as awarded immediately to prevent race conditions
-  if (typeof window !== 'undefined') {
-    localStorage.setItem(processedKey, 'true');
-  }
-  if (user) {
-    user.referralRewardGiven = true;
-    user.referredBy = referredBy;
-    saveUsers(users);
-  }
-
-  const completedJoinerPatch = {
-    referredBy,
-    referralRewardGiven: true,
-    hasScratchedFirstCard: true,
-    referralCompletedAt: Date.now(),
-  };
-
-  fetch(`${RTDB_BASE_URL}/users/${cleanCurrentId}.json`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(completedJoinerPatch),
-  }).catch(() => {});
-
-  if (rtdb && cleanCurrentId) {
-    update(ref(rtdb, `users/${cleanCurrentId}`), completedJoinerPatch).catch(() => {});
-  }
-
-  // Award strictly +1 Scratch Card & +1 Friend to the Referrer in Firebase RTDB (NEVER direct cash!)
-  let referrerSpins = 2;
-  try {
-    let refVal: any = null;
-    try {
-      const rResp = await fetch(`${RTDB_BASE_URL}/users/${referredBy}.json`, { cache: 'no-store' });
-      if (rResp.ok) {
-        refVal = await rResp.json();
-      }
-    } catch {
-      // ignore
-    }
-
-    if (!refVal && rtdb) {
-      const refSnap = await get(ref(rtdb, `users/${referredBy}`));
-      if (refSnap.exists()) {
-        refVal = refSnap.val();
-      }
-    }
-
-    // Check if this joiner was already counted in referrals/{referredBy}/{cleanCurrentId} with completed_first_spin
-    let alreadyCounted = false;
-    try {
-      const existRefResp = await fetch(`${RTDB_BASE_URL}/referrals/${referredBy}/${cleanCurrentId}.json`, {
-        cache: 'no-store',
-      });
-      if (existRefResp.ok) {
-        const existRefData = await existRefResp.json();
-        if (existRefData && existRefData.status === 'completed_first_spin') {
-          alreadyCounted = true;
+      const resp = await fetch(`${RTDB_BASE_URL}/users/${cleanCurrentId}.json`, { cache: 'no-store' });
+      if (resp.ok) {
+        const val = await resp.json();
+        if (val && typeof val === 'object') {
+          if (val.deviceBlocked === true) {
+            markUserIdBlockedLocally(cleanCurrentId);
+            return false;
+          }
+          if (val.referralRewardGiven) {
+            if (typeof window !== 'undefined') localStorage.setItem(processedKey, 'true');
+            return false;
+          }
+          if (!referredBy && val.referredBy) {
+            referredBy = String(val.referredBy);
+          }
+          userName = val.name || userName;
+          userUsername = val.username || userUsername;
         }
       }
     } catch {
-      // ignore
+      // Fallback to SDK below
     }
+
+    if (!referredBy && rtdb && cleanCurrentId) {
+      try {
+        const snap = await get(ref(rtdb, `users/${cleanCurrentId}`));
+        if (snap.exists()) {
+          const val = snap.val();
+          if (val.deviceBlocked === true) {
+            markUserIdBlockedLocally(cleanCurrentId);
+            return false;
+          }
+          if (val.referralRewardGiven) {
+            if (typeof window !== 'undefined') localStorage.setItem(processedKey, 'true');
+            return false;
+          }
+          if (!referredBy && val.referredBy) {
+            referredBy = val.referredBy;
+          }
+          userName = val.name || userName;
+          userUsername = val.username || userUsername;
+        }
+      } catch (e) {
+        console.warn('Notice checking RTDB for referrer:', e);
+      }
+    }
+
+    // 3. Check localStorage fallback & URL start param
+    if (!referredBy && typeof window !== 'undefined') {
+      referredBy =
+        localStorage.getItem('rg_pending_referrer_id') ||
+        sessionStorage.getItem('rg_pending_ref_code') ||
+        new URLSearchParams(window.location.search).get('start');
+    }
+
+    if (!referredBy) return false;
+
+    referredBy = String(referredBy)
+      .replace(/^ref_/i, '')
+      .replace(/^ref-/i, '')
+      .replace(/^ref/i, '')
+      .trim();
+
+    if (!referredBy || !/^\d+$/.test(referredBy) || referredBy === cleanCurrentId) return false;
+    if (boundTelegramId && String(boundTelegramId).trim() === referredBy) return false;
+
+    // Mark as awarded immediately to prevent race conditions
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(processedKey, 'true');
+    }
+    if (user) {
+      user.referralRewardGiven = true;
+      user.referredBy = referredBy;
+      saveUsers(users);
+    }
+
+    const completedJoinerPatch = {
+      referredBy,
+      referralRewardGiven: true,
+      hasScratchedFirstCard: true,
+      referralCompletedAt: Date.now(),
+    };
+
+    fetch(`${RTDB_BASE_URL}/users/${cleanCurrentId}.json`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(completedJoinerPatch),
+    }).catch(() => {});
+
+    if (rtdb && cleanCurrentId) {
+      update(ref(rtdb, `users/${cleanCurrentId}`), completedJoinerPatch).catch(() => {});
+    }
+
+    // Award strictly +1 Scratch Card & +1 Friend to the Referrer in Firebase RTDB (NEVER direct cash!)
+    let referrerSpins = 2;
+    try {
+      let refVal: any = null;
+      try {
+        const rResp = await fetch(`${RTDB_BASE_URL}/users/${referredBy}.json`, { cache: 'no-store' });
+        if (rResp.ok) {
+          refVal = await rResp.json();
+        }
+      } catch {
+        // ignore
+      }
+
+      if (!refVal && rtdb) {
+        const refSnap = await get(ref(rtdb, `users/${referredBy}`));
+        if (refSnap.exists()) {
+          refVal = refSnap.val();
+        }
+      }
+
+      // Prevent circular referral reward (if referrer was referred by cleanCurrentId)
+      if (refVal && String(refVal.referredBy || '').trim() === cleanCurrentId) {
+        return false;
+      }
+
+      // Check if this joiner was already counted in referrals/{referredBy}/{cleanCurrentId} with completed_first_spin
+      let alreadyCounted = false;
+      try {
+        const existRefResp = await fetch(`${RTDB_BASE_URL}/referrals/${referredBy}/${cleanCurrentId}.json`, {
+          cache: 'no-store',
+        });
+        if (existRefResp.ok) {
+          const existRefData = await existRefResp.json();
+          if (existRefData && (existRefData.status === 'completed_first_spin' || existRefData.rewardGiven === true)) {
+            alreadyCounted = true;
+          }
+        }
+      } catch {
+        // ignore
+      }
+
+      if (alreadyCounted) {
+        return false;
+      }
 
     if (!alreadyCounted) {
       if (refVal && typeof refVal === 'object') {
@@ -2129,8 +2217,11 @@ export async function creditReferralAfterFirstSpin(currentUserId: string): Promi
     }
   }
 
-  notifySubscribers('referral_completed');
-  return true;
+    notifySubscribers('referral_completed');
+    return true;
+  } finally {
+    activeReferralLocks.delete(cleanCurrentId);
+  }
 }
 
 export function getReferralTransactions(userId: string): Transaction[] {

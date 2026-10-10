@@ -140,7 +140,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   // Reveal Prize: Smoothly clear foil, award cash, show win modal
   // -------------------------------------------------------------
   const handleRevealPrize = useCallback(() => {
-    if (hasTriggeredWinRef.current) return;
+    if (hasTriggeredWinRef.current || !isScratchingRef.current) return;
     hasTriggeredWinRef.current = true;
 
     // Instantly & cleanly erase all remaining silver foil
@@ -322,21 +322,23 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const handleAutoScratch = () => {
     if (isScratched || hasTriggeredWinRef.current) return;
 
-    if (userRef.current.spins <= 0) {
-      triggerHaptic('error');
-      setNoScratchesModal(true);
-      return;
-    }
+    if (!isScratchingRef.current) {
+      if (userRef.current.spins <= 0) {
+        triggerHaptic('error');
+        setNoScratchesModal(true);
+        return;
+      }
 
-    const decremented = decrementUserSpin(userRef.current.id);
-    if (!decremented) {
-      triggerHaptic('error');
-      setNoScratchesModal(true);
-      return;
+      const decremented = decrementUserSpin(userRef.current.id);
+      if (!decremented) {
+        triggerHaptic('error');
+        setNoScratchesModal(true);
+        return;
+      }
+      isScratchingRef.current = true;
     }
 
     setIsScratching(true);
-    isScratchingRef.current = true;
     triggerHaptic('heavy');
 
     const canvas = canvasRef.current;

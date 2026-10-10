@@ -594,21 +594,40 @@ def handle_start(chat_id, user: dict, args: list[str]):
         if clean_ref.isdigit():
             referrer_id = clean_ref
 
-    if referrer_id:
-        if referrer_id == user_id:
-            logger.info(f"Self-referral attempted by {user_id}")
-        elif is_already_referred(referrer_id, user_id):
-            logger.info(f"Duplicate referral attempted for {referrer_id} by {user_id}")
-        else:
-            record_referral(referrer_id, user_id, name, username, status="pending_first_scratch")
-            logger.info(f"Referral pending first scratch: {user_id} referred by {referrer_id}")
-
     existing = get_user_from_db(user_id)
     blocked_record = db_request(f"blocked_accounts/{user_id}.json")
     is_blocked = bool(
         (existing and existing.get("deviceBlocked") is True)
         or (blocked_record is True or (isinstance(blocked_record, dict) and blocked_record.get("blocked") is True))
     )
+
+    if referrer_id:
+        if referrer_id == user_id:
+            logger.info(f"Self-referral attempted by {user_id}")
+            referrer_id = None
+        elif is_blocked:
+            logger.info(f"Blocked account referral ignored for {user_id}")
+            referrer_id = None
+        elif existing and (
+            existing.get("referredBy")
+            or existing.get("referralRewardGiven")
+            or existing.get("hasScratchedFirstCard")
+            or (existing.get("balance") or 0) > 0
+            or (existing.get("friendsJoined") or 0) > 0
+        ):
+            logger.info(f"Existing user {user_id} cannot be referred by {referrer_id}")
+            referrer_id = existing.get("referredBy")
+        elif is_already_referred(referrer_id, user_id):
+            logger.info(f"Duplicate referral attempted for {referrer_id} by {user_id}")
+        else:
+            # Also check circular referral: if user_id previously referred referrer_id
+            ref_user_db = get_user_from_db(referrer_id)
+            if ref_user_db and str(ref_user_db.get("referredBy") or "").strip() == user_id:
+                logger.info(f"Circular referral blocked between {user_id} and {referrer_id}")
+                referrer_id = None
+            else:
+                record_referral(referrer_id, user_id, name, username, status="pending_first_scratch")
+                logger.info(f"Referral pending first scratch: {user_id} referred by {referrer_id}")
 
     if not existing:
         welcome_user = {

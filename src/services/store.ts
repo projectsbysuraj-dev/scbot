@@ -233,51 +233,30 @@ if (typeof window !== 'undefined' && rtdb) {
     console.warn('Firebase RTDB theme listener notice:', err);
   }
 
-  // 3. Withdrawals listener (Live real-time queue)
+  // 3. Withdrawals listener (Live real-time queue respecting deleted tombstones)
   try {
     onValue(ref(rtdb, 'withdrawals'), (snapshot) => {
       if (snapshot.exists()) {
         const val = snapshot.val();
         if (val && typeof val === 'object') {
+          const deletedIds = getDeletedWithdrawalIds();
           const arr = (Object.values(val) as WithdrawalRequest[]).filter(
-            (x) => x && typeof x === 'object' && x.id
+            (x) => x && typeof x === 'object' && x.id && !deletedIds.has(x.id)
           );
           arr.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
           localStorage.setItem(STORAGE_KEYS.WITHDRAWALS, JSON.stringify(arr));
           notifySubscribers('firebase_withdrawals');
         }
+      } else {
+        localStorage.setItem(STORAGE_KEYS.WITHDRAWALS, JSON.stringify([]));
+        notifySubscribers('firebase_withdrawals');
       }
     });
   } catch (err) {
     console.warn('Firebase RTDB withdrawals listener notice:', err);
   }
 
-  // 4. Current User Targeted Listener (Prevents downloading entire users database on every client!)
-  try {
-    const activeUserId = localStorage.getItem(STORAGE_KEYS.CURRENT_USER_ID);
-    if (activeUserId) {
-      onValue(ref(rtdb, `users/${activeUserId}`), (snapshot) => {
-        if (snapshot.exists()) {
-          const val = snapshot.val() as UserProfile;
-          if (val && val.id) {
-            const users = getAllUsers();
-            const idx = users.findIndex((u) => String(u.id).trim() === String(val.id).trim());
-            if (idx >= 0) {
-              users[idx] = { ...users[idx], ...val };
-            } else {
-              users.push(val);
-            }
-            localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
-            notifySubscribers('firebase_current_user');
-          }
-        }
-      });
-    }
-  } catch (err) {
-    console.warn('Firebase RTDB current user listener notice:', err);
-  }
-
-  // 5. Admin Credentials listener
+  // 4. Admin Credentials listener
   try {
     onValue(ref(rtdb, 'admin_auth'), (snapshot) => {
       if (snapshot.exists()) {
@@ -290,6 +269,48 @@ if (typeof window !== 'undefined' && rtdb) {
     });
   } catch (err) {
     console.warn('Firebase RTDB admin_auth listener notice:', err);
+  }
+}
+
+let subscribedRealtimeUserId: string | null = null;
+
+function ensureRealtimeUserListener(userId: string): void {
+  if (typeof window === 'undefined' || !rtdb || !userId) return;
+  const cleanId = String(userId).trim();
+  if (!cleanId || subscribedRealtimeUserId === cleanId) return;
+  subscribedRealtimeUserId = cleanId;
+
+  try {
+    onValue(ref(rtdb, `users/${cleanId}`), (snapshot) => {
+      if (snapshot.exists()) {
+        const val = snapshot.val() as UserProfile;
+        if (val && (val.id || val.telegramId || val.name)) {
+          // Respect active local mutation grace window (3.5s) so claiming/scratching never flickers
+          const lastMutated = userMutationTimestamps.get(cleanId) || 0;
+          if (Date.now() - lastMutated < 3500) {
+            return;
+          }
+          val.id = String(val.id || cleanId).trim();
+          val.telegramId = String(val.telegramId || cleanId).trim();
+          val.balance = Number(val.balance) || 0;
+          val.spins = typeof val.spins === 'number' ? Math.max(0, val.spins) : 0;
+          val.friendsJoined = Number(val.friendsJoined) || 0;
+          val.spinsEarned = Number(val.spinsEarned) || 1;
+
+          const users = getAllUsers();
+          const idx = users.findIndex((u) => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
+          if (idx >= 0) {
+            users[idx] = { ...users[idx], ...val };
+          } else {
+            users.push(val);
+          }
+          localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+          notifySubscribers('firebase_current_user');
+        }
+      }
+    });
+  } catch (err) {
+    console.warn('Firebase RTDB dynamic user listener notice:', err);
   }
 }
 
@@ -632,50 +653,50 @@ export async function seed20DummyUsers(): Promise<UserProfile[]> {
   return getAllUsers();
 }
 
+// Track per-user mutation timestamps so background syncUserWithRemote (every 3.5s)
+// never overwrites an active local scratch or balance update with a stale remote snapshot
+const userMutationTimestamps = new Map<string, number>();
+
+export function markUserMutated(userId: string): void {
+  const cleanId = String(userId).trim();
+  if (cleanId) {
+    userMutationTimestamps.set(cleanId, Date.now());
+  }
+}
+
 export function saveUsers(users: UserProfile[]): void {
   localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
   notifySubscribers('users_updated');
-
-  // Push to Firebase Realtime Database
-  const db = rtdb;
-  if (db) {
-    users.forEach((u) => {
-      try {
-        const cleanUser = sanitizeForFirebase(u);
-        set(ref(db, `users/${u.id}`), cleanUser).catch((e) => {
-          console.warn(`Firebase saveUser ${u.id} notice:`, e);
-        });
-      } catch (err) {
-        console.warn(`Firebase saveUser ${u.id} error:`, err);
-      }
-    });
-  }
 }
 
 export function saveSingleUser(u: UserProfile): void {
   const users = getAllUsers();
   const cleanId = String(u.id).trim();
+  if (!cleanId) return;
+
+  markUserMutated(cleanId);
+
   const idx = users.findIndex(x => String(x.id).trim() === cleanId || String(x.telegramId).trim() === cleanId);
   if (idx >= 0) {
-    users[idx] = u;
+    users[idx] = { ...users[idx], ...u, id: cleanId };
   } else {
-    users.push(u);
+    users.push({ ...u, id: cleanId });
   }
   localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
   notifySubscribers('users_updated');
 
-  const cleanUser = sanitizeForFirebase(u);
+  const cleanUser = sanitizeForFirebase({ ...u, id: cleanId });
 
   if (rtdb) {
     try {
-      set(ref(rtdb, `users/${u.id}`), cleanUser).catch(() => {});
+      update(ref(rtdb, `users/${cleanId}`), cleanUser).catch(() => {});
     } catch {
       // Ignore
     }
   }
   try {
-    fetch(`${RTDB_BASE_URL}/users/${u.id}.json`, {
-      method: 'PUT',
+    fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, {
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(cleanUser),
     }).catch(() => {});
@@ -713,31 +734,59 @@ export function hasUserPlayedScratchLocally(userId: string): boolean {
   );
 }
 
-export async function syncUserWithRemote(userId: string): Promise<UserProfile | null> {
+export async function syncUserWithRemote(userId: string, force = false): Promise<UserProfile | null> {
   try {
     const cleanId = String(userId).trim();
     if (!cleanId) return null;
+
+    // Do not overwrite active local scratch / balance changes while a mutation is in flight (within 3.5 seconds)
+    const lastMutated = userMutationTimestamps.get(cleanId) || 0;
+    if (!force && Date.now() - lastMutated < 3500) {
+      const localUsers = getAllUsers();
+      return localUsers.find(x => String(x.id).trim() === cleanId || String(x.telegramId).trim() === cleanId) || null;
+    }
+
     const resp = await fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, {
       cache: 'no-store',
     });
     const contentType = resp.headers.get('content-type') || '';
     if (resp.ok && contentType.includes('application/json')) {
       const remoteUser = await resp.json();
+
+      // Re-check after network await: if user scratched while fetch was in flight, keep local state!
+      const postFetchMutated = userMutationTimestamps.get(cleanId) || 0;
+      if (!force && Date.now() - postFetchMutated < 3500) {
+        const localUsers = getAllUsers();
+        return localUsers.find(x => String(x.id).trim() === cleanId || String(x.telegramId).trim() === cleanId) || null;
+      }
+
       if (remoteUser && typeof remoteUser === 'object' && (remoteUser.id || remoteUser.telegramId || remoteUser.name || remoteUser.referredBy)) {
         remoteUser.id = String(remoteUser.id || cleanId).trim();
         remoteUser.telegramId = String(remoteUser.telegramId || cleanId).trim();
+        remoteUser.balance = Number(remoteUser.balance) || 0;
+        remoteUser.spins = typeof remoteUser.spins === 'number' ? Math.max(0, remoteUser.spins) : 0;
+        remoteUser.friendsJoined = Number(remoteUser.friendsJoined) || 0;
+        remoteUser.spinsEarned = Number(remoteUser.spinsEarned) || 1;
+
+        const users = getAllUsers();
+        const idx = users.findIndex(x => String(x.id).trim() === cleanId || String(x.telegramId).trim() === cleanId);
+        const localExisting = idx >= 0 ? users[idx] : null;
 
         const playedAlready =
-          Number(remoteUser.balance || 0) > 0 ||
+          remoteUser.claimedWelcomeSpin === true ||
+          (localExisting && localExisting.claimedWelcomeSpin === true) ||
+          remoteUser.balance > 0 ||
+          (localExisting && Number(localExisting.balance || 0) > 0) ||
           remoteUser.referralRewardGiven === true ||
           remoteUser.hasScratchedFirstCard === true ||
+          (localExisting && (localExisting as any).hasScratchedFirstCard === true) ||
           hasUserPlayedScratchLocally(cleanId);
 
-        // Guarantee 1 Sign Up Scratch Card if user has never scratched yet (balance === 0 and not played)
+        // Guarantee 1 Sign Up Scratch Card ONLY if user is brand new and has NEVER received or scratched their welcome card
         let needsRemotePatch = false;
-        if (!playedAlready && (typeof remoteUser.spins !== 'number' || remoteUser.spins < 1)) {
+        if (!playedAlready && remoteUser.spins < 1) {
           remoteUser.spins = 1;
-          remoteUser.spinsEarned = Math.max(Number(remoteUser.spinsEarned) || 0, 1);
+          remoteUser.spinsEarned = Math.max(remoteUser.spinsEarned, 1);
           remoteUser.claimedWelcomeSpin = true;
           needsRemotePatch = true;
         }
@@ -754,8 +803,6 @@ export async function syncUserWithRemote(userId: string): Promise<UserProfile | 
           }).catch(() => {});
         }
 
-        const users = getAllUsers();
-        const idx = users.findIndex(x => String(x.id).trim() === cleanId || String(x.telegramId).trim() === cleanId);
         let updated: UserProfile;
         if (idx >= 0) {
           updated = { ...users[idx], ...remoteUser };
@@ -809,6 +856,7 @@ export function getCurrentUser(): UserProfile {
 
   let user = users.find(u => String(u.id).trim() === effectiveId || String(u.telegramId).trim() === effectiveId);
   const isLocallyBlockedUid = isUserIdBlockedLocally(effectiveId);
+  ensureRealtimeUserListener(effectiveId);
 
   if (!user) {
     // Auto register user with strictly ₹0 balance and 1 free signup scratch card
@@ -830,13 +878,24 @@ export function getCurrentUser(): UserProfile {
     };
     users.push(newUser);
     saveUsers(users);
-    addTransaction({
-      userId: effectiveId,
-      type: 'welcome_bonus',
-      amount: 0,
-      description: 'Sign Up Bonus: 1 Free Scratch Card',
-      status: 'completed',
-    });
+    // Check remote first before writing brand-new user so we never overwrite an existing Firebase user
+    fetch(`${RTDB_BASE_URL}/users/${effectiveId}.json`, { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(rem => {
+        if (!rem || typeof rem !== 'object' || (!rem.id && !rem.telegramId && !rem.name && typeof rem.balance !== 'number')) {
+          saveSingleUser(newUser);
+          addTransaction({
+            userId: effectiveId,
+            type: 'welcome_bonus',
+            amount: 0,
+            description: 'Sign Up Bonus: 1 Free Scratch Card',
+            status: 'completed',
+          });
+        } else {
+          syncUserWithRemote(effectiveId, true);
+        }
+      })
+      .catch(() => {});
     user = newUser;
   } else {
     if (isLocallyBlockedUid || user.deviceBlocked) {
@@ -844,35 +903,41 @@ export function getCurrentUser(): UserProfile {
       user.isVerified = false;
       user.deviceVerified = false;
     }
-    // Sync latest Telegram metadata if available
+    // Sync latest Telegram metadata if available (only patch metadata fields, never touch balance/spins!)
     if (tgUser) {
       const freshName = `${tgUser.first_name}${tgUser.last_name ? ' ' + tgUser.last_name : ''}`.trim();
-      let hasUpdates = false;
+      const metaPatch: Record<string, any> = {};
       if (freshName && !freshName.startsWith('User #') && user.name !== freshName) {
         user.name = freshName;
-        hasUpdates = true;
+        metaPatch.name = freshName;
       }
       if (tgUser.username && user.username !== tgUser.username) {
         user.username = tgUser.username;
-        hasUpdates = true;
+        metaPatch.username = tgUser.username;
       }
       if (tgUser.photo_url && user.photoUrl !== tgUser.photo_url) {
         user.photoUrl = tgUser.photo_url;
-        hasUpdates = true;
+        metaPatch.photoUrl = tgUser.photo_url;
       }
-      if (hasUpdates) {
+      if (Object.keys(metaPatch).length > 0) {
         saveUsers(users);
+        fetch(`${RTDB_BASE_URL}/users/${effectiveId}.json`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(metaPatch),
+        }).catch(() => {});
       }
     }
 
     const playedAlready =
+      user.claimedWelcomeSpin === true ||
       Number(user.balance || 0) > 0 ||
       user.referralRewardGiven === true ||
       (user as any).hasScratchedFirstCard === true ||
       hasUserPlayedScratchLocally(effectiveId);
 
     if (!playedAlready && (typeof user.spins !== 'number' || user.spins < 1)) {
-      // Guarantee 1 Sign Up Bonus scratch card if user hasn't played any scratch card yet
+      // Guarantee 1 Sign Up Bonus scratch card ONLY if user has never received or played their welcome card
       user.claimedWelcomeSpin = true;
       user.spins = 1;
       user.spinsEarned = Math.max(user.spinsEarned || 0, 1);
@@ -914,22 +979,83 @@ export function createOrUpdateUser(profile: Partial<UserProfile> & { id: string 
     users.push(updatedUser);
   }
 
-  saveUsers(users);
+  saveSingleUser(updatedUser);
   return updatedUser;
 }
 
+/**
+ * Adds or subtracts spins for a user.
+ * Fetches LIVE user state from Firebase RTDB before applying the delta so Admin Portal
+ * never overwrites a user's freshly earned balance or scratched cards with a stale snapshot!
+ */
 export function addSpinsToUser(userId: string, spinsToAdd: number): UserProfile | null {
   const users = getAllUsers();
   const cleanId = String(userId).trim();
-  const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
-  if (!user) return null;
+  if (!cleanId) return null;
 
-  user.spins = Math.max(0, (user.spins || 0) + spinsToAdd);
-  if (spinsToAdd > 0) {
-    user.spinsEarned = (user.spinsEarned || 0) + spinsToAdd;
+  markUserMutated(cleanId);
+
+  const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
+  if (user) {
+    user.spins = Math.max(0, (Number(user.spins) || 0) + spinsToAdd);
+    if (spinsToAdd > 0) {
+      user.spinsEarned = (Number(user.spinsEarned) || 0) + spinsToAdd;
+    }
+    localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+    notifySubscribers('users_updated');
   }
-  saveSingleUser(user);
-  return user;
+
+  // Perform atomic live read + PATCH against Firebase RTDB so balance and other fields are NEVER touched!
+  fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, { cache: 'no-store' })
+    .then(r => (r.ok ? r.json() : null))
+    .then(rem => {
+      const baseSpins = rem && typeof rem.spins === 'number' ? rem.spins : (user ? Math.max(0, (user.spins || 0) - spinsToAdd) : 0);
+      const baseEarned = rem && typeof rem.spinsEarned === 'number' ? rem.spinsEarned : (user ? Math.max(0, (user.spinsEarned || 0) - Math.max(0, spinsToAdd)) : 1);
+      const nextSpins = Math.max(0, baseSpins + spinsToAdd);
+      const nextEarned = spinsToAdd > 0 ? baseEarned + spinsToAdd : baseEarned;
+      const spinPatch = {
+        spins: nextSpins,
+        spinsEarned: nextEarned,
+      };
+
+      fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(spinPatch),
+      }).catch(() => {});
+
+      if (rtdb) {
+        update(ref(rtdb, `users/${cleanId}`), spinPatch).catch(() => {});
+      }
+
+      // Sync merged live user back into local cache
+      const allNow = getAllUsers();
+      const idxNow = allNow.findIndex(x => String(x.id).trim() === cleanId || String(x.telegramId).trim() === cleanId);
+      if (idxNow >= 0) {
+        allNow[idxNow] = {
+          ...allNow[idxNow],
+          ...(rem && typeof rem === 'object' ? rem : {}),
+          spins: nextSpins,
+          spinsEarned: nextEarned,
+        };
+        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(allNow));
+        notifySubscribers('users_updated');
+      }
+    })
+    .catch(() => {
+      if (user) {
+        fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            spins: user.spins,
+            spinsEarned: user.spinsEarned,
+          }),
+        }).catch(() => {});
+      }
+    });
+
+  return user || null;
 }
 
 export function addFreeTestScratches(userId: string, count = 5): UserProfile | null {
@@ -946,6 +1072,11 @@ export function addFreeTestScratches(userId: string, count = 5): UserProfile | n
   return user;
 }
 
+/**
+ * Adds or subtracts balance for a user.
+ * When called from Scratch Win or Admin Panel, ONLY patches the `balance` field in Firebase RTDB
+ * (reading live balance first if needed) so `spins` and `balance` NEVER overwrite or convert into each other!
+ */
 export function addBalanceToUser(
   userId: string,
   amount: number,
@@ -955,15 +1086,78 @@ export function addBalanceToUser(
 ): UserProfile | null {
   const users = getAllUsers();
   const cleanId = String(userId).trim();
-  const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
-  if (!user) return null;
+  if (!cleanId) return null;
 
-  user.balance = Math.max(0, Number((user.balance + amount).toFixed(2)));
-  saveSingleUser(user);
+  markUserMutated(cleanId);
+
+  const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
+  if (user) {
+    user.balance = Math.max(0, Number(((Number(user.balance) || 0) + amount).toFixed(2)));
+    if (txType === 'spin_win') {
+      (user as any).hasScratchedFirstCard = true;
+    }
+    localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+    notifySubscribers('users_updated');
+  }
+
+  // Fetch live user from Firebase RTDB and PATCH only balance (never overwriting spins!)
+  fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, { cache: 'no-store' })
+    .then(r => (r.ok ? r.json() : null))
+    .then(rem => {
+      const baseBalance =
+        rem && typeof rem.balance === 'number'
+          ? Number(rem.balance)
+          : user
+          ? Math.max(0, Number((user.balance - amount).toFixed(2)))
+          : 0;
+      const nextBalance = Math.max(0, Number((baseBalance + amount).toFixed(2)));
+      const balancePatch: Record<string, any> = {
+        balance: nextBalance,
+      };
+      if (txType === 'spin_win') {
+        balancePatch.hasScratchedFirstCard = true;
+      }
+
+      fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(balancePatch),
+      }).catch(() => {});
+
+      if (rtdb) {
+        update(ref(rtdb, `users/${cleanId}`), balancePatch).catch(() => {});
+      }
+
+      const allNow = getAllUsers();
+      const idxNow = allNow.findIndex(x => String(x.id).trim() === cleanId || String(x.telegramId).trim() === cleanId);
+      if (idxNow >= 0) {
+        allNow[idxNow] = {
+          ...allNow[idxNow],
+          ...(rem && typeof rem === 'object' ? rem : {}),
+          balance: nextBalance,
+          // Keep local spins if user just scratched a card within the last 3.5 seconds
+          spins: txType === 'spin_win' ? allNow[idxNow].spins : (rem && typeof rem.spins === 'number' ? rem.spins : allNow[idxNow].spins),
+        };
+        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(allNow));
+        notifySubscribers('users_updated');
+      }
+    })
+    .catch(() => {
+      if (user) {
+        fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            balance: user.balance,
+            ...(txType === 'spin_win' ? { hasScratchedFirstCard: true } : {}),
+          }),
+        }).catch(() => {});
+      }
+    });
 
   if (recordTransaction) {
     addTransaction({
-      userId: user.id,
+      userId: cleanId,
       type: txType,
       amount,
       description,
@@ -971,7 +1165,7 @@ export function addBalanceToUser(
     });
   }
 
-  return user;
+  return user || null;
 }
 
 export function decrementUserSpin(userId: string): boolean {
@@ -980,12 +1174,132 @@ export function decrementUserSpin(userId: string): boolean {
   const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
   if (!user || user.spins <= 0) return false;
 
-  user.spins -= 1;
+  markUserMutated(cleanId);
+
+  user.spins = Math.max(0, user.spins - 1);
   (user as any).hasScratchedFirstCard = true;
   if (typeof window !== 'undefined') {
     localStorage.setItem(`rg_user_played_first_scratch_${cleanId}`, 'true');
   }
-  saveSingleUser(user);
+  localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+  notifySubscribers('users_updated');
+
+  const spinDecrementPatch = {
+    spins: user.spins,
+    hasScratchedFirstCard: true,
+  };
+
+  if (rtdb) {
+    update(ref(rtdb, `users/${cleanId}`), spinDecrementPatch).catch(() => {});
+  }
+  fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(spinDecrementPatch),
+  }).catch(() => {});
+
+  return true;
+}
+
+/**
+ * Atomically deducts 1 scratch card AND adds ₹winAmount to the user's balance ONLY when the user clicks "Claim".
+ * Prevents partial scratch loss if the user touches the card and closes/refreshes before claiming!
+ */
+export function completeScratchAndClaimReward(
+  userId: string,
+  winAmount: number,
+  description = `Won ₹${winAmount} in Scratch & Win!`
+): boolean {
+  const users = getAllUsers();
+  const cleanId = String(userId).trim();
+  if (!cleanId) return false;
+
+  const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
+  if (!user || (Number(user.spins) || 0) <= 0) return false;
+
+  markUserMutated(cleanId);
+
+  const nextLocalSpins = Math.max(0, (Number(user.spins) || 0) - 1);
+  const nextLocalBalance = Math.max(0, Number(((Number(user.balance) || 0) + winAmount).toFixed(2)));
+
+  user.spins = nextLocalSpins;
+  user.balance = nextLocalBalance;
+  user.claimedWelcomeSpin = true;
+  (user as any).hasScratchedFirstCard = true;
+
+  if (typeof window !== 'undefined') {
+    localStorage.setItem(`rg_user_played_first_scratch_${cleanId}`, 'true');
+  }
+
+  localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+  notifySubscribers('users_updated');
+
+  // Perform single atomic read + PATCH to Firebase RTDB so spins and balance update together
+  fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, { cache: 'no-store' })
+    .then(r => (r.ok ? r.json() : null))
+    .then(rem => {
+      const remSpins = rem && typeof rem.spins === 'number' ? rem.spins : nextLocalSpins + 1;
+      const remBalance = rem && typeof rem.balance === 'number' ? Number(rem.balance) : Math.max(0, Number((nextLocalBalance - winAmount).toFixed(2)));
+      const finalSpins = Math.max(0, remSpins - 1);
+      const finalBalance = Math.max(0, Number((remBalance + winAmount).toFixed(2)));
+
+      const atomicPatch = {
+        spins: finalSpins,
+        balance: finalBalance,
+        claimedWelcomeSpin: true,
+        hasScratchedFirstCard: true,
+      };
+
+      fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(atomicPatch),
+      }).catch(() => {});
+
+      if (rtdb) {
+        update(ref(rtdb, `users/${cleanId}`), atomicPatch).catch(() => {});
+      }
+
+      const allNow = getAllUsers();
+      const idxNow = allNow.findIndex(x => String(x.id).trim() === cleanId || String(x.telegramId).trim() === cleanId);
+      if (idxNow >= 0) {
+        allNow[idxNow] = {
+          ...allNow[idxNow],
+          ...(rem && typeof rem === 'object' ? rem : {}),
+          spins: finalSpins,
+          balance: finalBalance,
+          claimedWelcomeSpin: true,
+          hasScratchedFirstCard: true,
+        } as UserProfile;
+        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(allNow));
+        notifySubscribers('users_updated');
+      }
+    })
+    .catch(() => {
+      const fallbackPatch = {
+        spins: nextLocalSpins,
+        balance: nextLocalBalance,
+        claimedWelcomeSpin: true,
+        hasScratchedFirstCard: true,
+      };
+      fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fallbackPatch),
+      }).catch(() => {});
+      if (rtdb) {
+        update(ref(rtdb, `users/${cleanId}`), fallbackPatch).catch(() => {});
+      }
+    });
+
+  addTransaction({
+    userId: cleanId,
+    type: 'spin_win',
+    amount: winAmount,
+    description,
+    status: 'completed',
+  });
+
   return true;
 }
 
@@ -1201,7 +1515,20 @@ export async function refreshUsersFromRemote(): Promise<UserProfile[]> {
     if (resp.ok && contentType.includes('application/json')) {
       const data = await resp.json();
       if (data && typeof data === 'object') {
-        const arr = (Object.values(data) as UserProfile[]).filter((x) => x && x.id);
+        const existingLocal = getAllUsers();
+        const localMap = new Map(existingLocal.map((u) => [String(u.id).trim(), u]));
+        const now = Date.now();
+
+        const arr = (Object.values(data) as UserProfile[])
+          .filter((x) => x && x.id)
+          .map((remU) => {
+            const uid = String(remU.id).trim();
+            const lastMut = userMutationTimestamps.get(uid) || 0;
+            if (now - lastMut < 3500 && localMap.has(uid)) {
+              return localMap.get(uid)!;
+            }
+            return remU;
+          });
         arr.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(arr));
         notifySubscribers('remote_users_synced');
@@ -1240,11 +1567,17 @@ export async function fetchUsersBatchFromRemote(
           .map((k) => data[k] as UserProfile)
           .filter((x) => x && x.id);
 
-        // Merge loaded batch into local cache without overwriting other users
+        // Merge loaded batch into local cache without overwriting other users or in-flight mutations
         const existing = getAllUsers();
         const existingMap = new Map(existing.map((u) => [String(u.id).trim(), u]));
+        const now = Date.now();
         for (const u of batchUsers) {
-          existingMap.set(String(u.id).trim(), u);
+          const uid = String(u.id).trim();
+          const lastMut = userMutationTimestamps.get(uid) || 0;
+          if (now - lastMut < 3500 && existingMap.has(uid)) {
+            continue;
+          }
+          existingMap.set(uid, u);
         }
         const merged = Array.from(existingMap.values());
         localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(merged));
@@ -1307,6 +1640,9 @@ export async function requestWithdrawal(
           if (typeof remUser.balance === 'number') {
             u.balance = Number(remUser.balance);
           }
+          if (typeof remUser.spins === 'number') {
+            u.spins = Number(remUser.spins);
+          }
         }
       }
     } catch {
@@ -1326,15 +1662,26 @@ export async function requestWithdrawal(
       return { success: false, error: 'Withdrawal already submitted! Please wait a moment.' };
     }
 
-    // Deduct balance immediately and commit to Firebase RTDB before creating withdrawal record
+    // Deduct balance immediately and PATCH only balance + hasScratchedFirstCard to Firebase RTDB so spins are NEVER touched
+    markUserMutated(u.id);
     u.balance = Number(Math.max(0, u.balance - numAmount).toFixed(2));
-    saveSingleUser(u);
+    u.claimedWelcomeSpin = true;
+    (u as any).hasScratchedFirstCard = true;
+    saveUsers(users);
     try {
+      const withdrawalBalancePatch = {
+        balance: u.balance,
+        claimedWelcomeSpin: true,
+        hasScratchedFirstCard: true,
+      };
       await fetch(`${RTDB_BASE_URL}/users/${u.id}.json`, {
-        method: 'PUT',
+        method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(sanitizeForFirebase(u)),
+        body: JSON.stringify(withdrawalBalancePatch),
       });
+      if (rtdb) {
+        update(ref(rtdb, `users/${u.id}`), withdrawalBalancePatch).catch(() => {});
+      }
     } catch {
       // Ignore network hiccup
     }
@@ -1563,25 +1910,49 @@ export async function rejectWithdrawal(withdrawalId: string, reason = 'Verificat
 
     const exactRefundedBalance = Number((currentLiveBalance + refundAmount).toFixed(2));
 
+    markUserMutated(cleanUserId);
+
     const updatedUser: UserProfile = {
       ...(localUser || remoteUser || {
         id: cleanUserId,
         telegramId: cleanUserId,
         name: item.userName || `User #${cleanUserId}`,
         username: `user_${cleanUserId}`,
-        spins: 1,
+        spins: 0,
         friendsJoined: 0,
         spinsEarned: 1,
         createdAt: Date.now(),
         isVerified: true,
         deviceVerified: true,
+        claimedWelcomeSpin: true,
       }),
       ...(remoteUser || {}),
       id: cleanUserId,
       balance: exactRefundedBalance,
     };
 
-    saveSingleUser(updatedUser);
+    const idxU = users.findIndex(x => String(x.id).trim() === cleanUserId || String(x.telegramId).trim() === cleanUserId);
+    if (idxU >= 0) {
+      users[idxU] = updatedUser;
+    } else {
+      users.push(updatedUser);
+    }
+    saveUsers(users);
+
+    // PATCH strictly only balance in Firebase RTDB so user's live spins are never overwritten!
+    const refundPatch = { balance: exactRefundedBalance };
+    try {
+      await fetch(`${RTDB_BASE_URL}/users/${cleanUserId}.json`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(refundPatch),
+      });
+    } catch {
+      // ignore
+    }
+    if (rtdb) {
+      update(ref(rtdb, `users/${cleanUserId}`), refundPatch).catch(() => {});
+    }
 
     // Update transaction
     const allTxs = getAllTransactions();
@@ -1811,29 +2182,6 @@ export function recordPendingReferral(referrerId: string, visitorId?: string): {
   }
 
   if (currentUserId) {
-    // Ensure we never overwrite a new user's 1 signup scratch card with a bare { referredBy } object
-    const fullReferredUser = user
-      ? sanitizeForFirebase({
-          ...user,
-          spins: Math.max(user.spins ?? 1, (user.balance || 0) === 0 ? 1 : 0),
-          spinsEarned: Math.max(user.spinsEarned ?? 1, 1),
-          claimedWelcomeSpin: true,
-          referredBy: cleanReferrerId,
-        })
-      : {
-          id: currentUserId,
-          telegramId: currentUserId,
-          name: `User #${currentUserId.slice(-4)}`,
-          balance: 0,
-          spins: 1,
-          friendsJoined: 0,
-          spinsEarned: 1,
-          createdAt: Date.now(),
-          claimedWelcomeSpin: true,
-          referredBy: cleanReferrerId,
-          referralRewardGiven: false,
-        };
-
     const pendingRefPayload = {
       joinerId: currentUserId,
       name: user?.name || `User #${currentUserId.slice(-4)}`,
@@ -1842,22 +2190,79 @@ export function recordPendingReferral(referrerId: string, visitorId?: string): {
       status: 'pending_first_scratch',
     };
 
-    if (rtdb) {
-      update(ref(rtdb, `users/${currentUserId}`), fullReferredUser).catch(() => {});
-      set(ref(rtdb, `referrals/${cleanReferrerId}/${currentUserId}`), pendingRefPayload).catch(() => {});
-    }
+    // Safely check live RTDB user first so we NEVER overwrite an existing user's balance or spins
+    fetch(`${RTDB_BASE_URL}/users/${currentUserId}.json`, { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((remUser) => {
+        if (remUser && typeof remUser === 'object' && (remUser.id || remUser.telegramId || remUser.name)) {
+          // Existing remote user: only set referredBy if they have never played or been referred yet
+          const alreadyPlayed =
+            Number(remUser.balance || 0) > 0 ||
+            remUser.referralRewardGiven === true ||
+            remUser.hasScratchedFirstCard === true ||
+            Number(remUser.friendsJoined || 0) > 0;
 
-    fetch(`${RTDB_BASE_URL}/users/${currentUserId}.json`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(fullReferredUser),
-    }).catch(() => {});
-
-    fetch(`${RTDB_BASE_URL}/referrals/${cleanReferrerId}/${currentUserId}.json`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(pendingRefPayload),
-    }).catch(() => {});
+          if (!alreadyPlayed && !remUser.referredBy) {
+            const safePatch: Record<string, any> = {
+              referredBy: cleanReferrerId,
+            };
+            if (typeof remUser.spins !== 'number' || remUser.spins < 1) {
+              safePatch.spins = 1;
+              safePatch.spinsEarned = Math.max(Number(remUser.spinsEarned) || 0, 1);
+              safePatch.claimedWelcomeSpin = true;
+            }
+            fetch(`${RTDB_BASE_URL}/users/${currentUserId}.json`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(safePatch),
+            }).catch(() => {});
+            if (rtdb) {
+              update(ref(rtdb, `users/${currentUserId}`), safePatch).catch(() => {});
+            }
+            fetch(`${RTDB_BASE_URL}/referrals/${cleanReferrerId}/${currentUserId}.json`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(pendingRefPayload),
+            }).catch(() => {});
+            if (rtdb) {
+              set(ref(rtdb, `referrals/${cleanReferrerId}/${currentUserId}`), pendingRefPayload).catch(() => {});
+            }
+          }
+        } else {
+          // Brand new user in RTDB: initialize with 1 Free Scratch Card and ₹0 balance
+          const newReferredDoc = sanitizeForFirebase({
+            id: currentUserId,
+            telegramId: currentUserId,
+            name: user?.name || `User #${currentUserId.slice(-4)}`,
+            username: user?.username || `user_${currentUserId.slice(-4)}`,
+            balance: 0,
+            spins: 1,
+            friendsJoined: 0,
+            spinsEarned: 1,
+            createdAt: Date.now(),
+            claimedWelcomeSpin: true,
+            referredBy: cleanReferrerId,
+            referralRewardGiven: false,
+          });
+          fetch(`${RTDB_BASE_URL}/users/${currentUserId}.json`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(newReferredDoc),
+          }).catch(() => {});
+          if (rtdb) {
+            update(ref(rtdb, `users/${currentUserId}`), newReferredDoc).catch(() => {});
+          }
+          fetch(`${RTDB_BASE_URL}/referrals/${cleanReferrerId}/${currentUserId}.json`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(pendingRefPayload),
+          }).catch(() => {});
+          if (rtdb) {
+            set(ref(rtdb, `referrals/${cleanReferrerId}/${currentUserId}`), pendingRefPayload).catch(() => {});
+          }
+        }
+      })
+      .catch(() => {});
   }
 
   return { success: true, message: 'Referrer recorded. Scratch card will unlock after first scratch!' };

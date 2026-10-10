@@ -25,7 +25,10 @@ export const InviteScreen: React.FC<InviteScreenProps> = ({ user, settings }) =>
 
   const botUsername = settings.botUsername || 'scratch_the_win_bot';
   const botReferralLink = `https://t.me/${botUsername}?start=ref_${user.id}`;
-  const totalReferralEarning = (user.spinsEarned || 0) * (settings.spinWinAmount || 5);
+  const totalReferralEarning = Math.max(
+    (user.friendsJoined || 0) * (settings.spinWinAmount || 5),
+    Math.round(user.balance || 0)
+  );
 
   const loadLatestReferrals = async () => {
     try {

@@ -651,9 +651,10 @@ def handle_start(chat_id, user: dict, args: list[str]):
         existing = welcome_user
     else:
         patch_data = {}
-        # Guarantee 1 signup scratch card for any new/referred user who hasn't scratched their 1st card yet
+        # Guarantee 1 signup scratch card for any new/referred user who hasn't received or scratched their 1st card yet
         has_played_first = bool(
-            (existing.get("balance") or 0) > 0
+            existing.get("claimedWelcomeSpin") is True
+            or (existing.get("balance") or 0) > 0
             or existing.get("hasScratchedFirstCard") is True
             or existing.get("referralRewardGiven") is True
         )

@@ -83,26 +83,40 @@ export function DeviceVerificationScreen({
       ? `${MINI_APP_URL}?uid=${rawUserCleanId}&start=ref_${referrerId.replace('ref_', '')}`
       : `${MINI_APP_URL}?uid=${rawUserCleanId}`;
 
-    // 1. Mark verified in Local Storage and Firebase RTDB while ensuring 1 Sign Up Scratch Card is intact
-    const initialSpins =
-      typeof user.spins === 'number' && user.spins > 0
-        ? user.spins
-        : (user.balance || 0) === 0
-        ? 1
-        : 0;
-    const initialSpinsEarned = Math.max(user.spinsEarned || 0, 1);
+    // 1. Mark verified in Local Storage and Firebase RTDB without overwriting live spins or balance!
+    let liveUserFromDb: any = null;
+    if (rawUserCleanId) {
+      try {
+        const uResp = await fetch(`${RTDB_BASE_URL}/users/${rawUserCleanId}.json`, { cache: 'no-store' });
+        if (uResp.ok) {
+          liveUserFromDb = await uResp.json();
+        }
+      } catch {
+        // Fallback to local state
+      }
+    }
 
-    const verifiedPatch = {
-      spins: initialSpins,
-      spinsEarned: initialSpinsEarned,
-      claimedWelcomeSpin: true,
+    const baseUser = liveUserFromDb && typeof liveUserFromDb === 'object' ? { ...user, ...liveUserFromDb } : user;
+    const alreadyPlayed =
+      baseUser.claimedWelcomeSpin === true ||
+      baseUser.hasScratchedFirstCard === true ||
+      baseUser.referralRewardGiven === true ||
+      Number(baseUser.balance || 0) > 0;
+
+    const verifiedPatch: Record<string, any> = {
       isVerified: true,
       deviceVerified: true,
       deviceVerifiedAt: Date.now(),
     };
 
+    if (!alreadyPlayed && (typeof baseUser.spins !== 'number' || baseUser.spins < 1)) {
+      verifiedPatch.spins = 1;
+      verifiedPatch.spinsEarned = Math.max(Number(baseUser.spinsEarned) || 0, 1);
+      verifiedPatch.claimedWelcomeSpin = true;
+    }
+
     saveSingleUser({
-      ...user,
+      ...baseUser,
       ...verifiedPatch,
     });
 

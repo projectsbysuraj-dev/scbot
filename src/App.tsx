@@ -11,7 +11,6 @@ import {
   subscribeRealtime,
   recordPendingReferral,
   syncUserWithRemote,
-  saveSingleUser,
 } from './services/store';
 import { initTelegramApp, getTelegramReferralParam } from './services/telegram';
 import { Header } from './components/Header';
@@ -117,9 +116,6 @@ export default function App() {
 
     // Run referral check immediately
     checkAndProcessReferral(initialUser);
-    if (!initialUser.deviceBlocked && initialUser.deviceVerified === true) {
-      saveSingleUser(initialUser);
-    }
 
     // Re-check after Telegram WebApp finishes injecting (250ms)
     const tgTimer = setTimeout(() => {

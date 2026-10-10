@@ -209,6 +209,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     // 2. Realtime state subscription
     const unsub = subscribeRealtime(() => {
       setWithdrawals(getAllWithdrawals());
+      setUsers(getAllUsers());
       setAdminCreds(getAdminCredentials());
     });
 

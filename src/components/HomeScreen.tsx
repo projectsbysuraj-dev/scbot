@@ -4,8 +4,7 @@ import { Send, Flame, Sparkles, Plus, X, RotateCcw, Moon, Sun } from 'lucide-rea
 import { AppSettings, UserProfile } from '../types';
 import { TabType } from './BottomNav';
 import {
-  decrementUserSpin,
-  addBalanceToUser,
+  completeScratchAndClaimReward,
   creditReferralAfterFirstSpin,
 } from '../services/store';
 import { triggerHaptic, openExternalOrTelegramLink } from '../services/telegram';
@@ -29,6 +28,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 }) => {
   const [isScratched, setIsScratched] = useState(false);
   const [isScratching, setIsScratching] = useState(false);
+  const [hasClaimedCurrentCard, setHasClaimedCurrentCard] = useState(false);
   const [wonModal, setWonModal] = useState<{ amount: number } | null>(null);
   const [noScratchesModal, setNoScratchesModal] = useState(false);
   const [cardKey, setCardKey] = useState(0); // to reset card for next scratch
@@ -43,6 +43,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const isPointerDownRef = useRef(false);
   const isScratchingRef = useRef(false);
   const hasTriggeredWinRef = useRef(false);
+  const hasClaimedRef = useRef(false);
   const scratchStrokeCountRef = useRef(0);
   const lastPointRef = useRef<{ x: number; y: number } | null>(null);
 
@@ -126,6 +127,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
     // Reset drawing tracking state
     hasTriggeredWinRef.current = false;
+    hasClaimedRef.current = false;
     scratchStrokeCountRef.current = 0;
     isScratchingRef.current = false;
     isPointerDownRef.current = false;
@@ -137,10 +139,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   }, [initFoilCanvas, cardKey]);
 
   // -------------------------------------------------------------
-  // Reveal Prize: Smoothly clear foil, award cash, show win modal
+  // Reveal Prize: Smoothly clear foil and show Claim Modal
+  // IMPORTANT: Does NOT deduct scratch card or add balance yet!
+  // Spin deduction + ₹5 credit + referral bonus happen ONLY when user clicks Claim!
   // -------------------------------------------------------------
   const handleRevealPrize = useCallback(() => {
     if (hasTriggeredWinRef.current || !isScratchingRef.current) return;
+    if (userRef.current.spins <= 0) {
+      setNoScratchesModal(true);
+      return;
+    }
     hasTriggeredWinRef.current = true;
 
     // Instantly & cleanly erase all remaining silver foil
@@ -156,13 +164,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
     setIsScratched(true);
     setIsScratching(false);
+    setHasClaimedCurrentCard(false);
+    hasClaimedRef.current = false;
     triggerHaptic('success');
-
-    // Credit ₹5 (or configured winAmount) to user balance
-    addBalanceToUser(userRef.current.id, winAmount, `Won ₹${winAmount} in Scratch & Win!`, true, 'spin_win');
-
-    // Referral bonus credit after first scratch
-    creditReferralAfterFirstSpin(userRef.current.id);
 
     // Confetti celebration
     try {
@@ -178,6 +182,53 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
     setWonModal({ amount: winAmount });
   }, [winAmount]);
+
+  // -------------------------------------------------------------
+  // Claim Reward Handler: Deducts 1 Scratch Card & Adds ₹5 ONLY when Claim is clicked!
+  // -------------------------------------------------------------
+  const handleClaimReward = useCallback(
+    (nextAction: 'next_card' | 'wallet' | 'close' = 'next_card') => {
+      if (!hasClaimedRef.current) {
+        const claimedOk = completeScratchAndClaimReward(
+          userRef.current.id,
+          winAmount,
+          `Won ₹${winAmount} in Scratch & Win!`
+        );
+        if (!claimedOk) {
+          triggerHaptic('error');
+          setWonModal(null);
+          setNoScratchesModal(true);
+          return;
+        }
+        hasClaimedRef.current = true;
+        setHasClaimedCurrentCard(true);
+        triggerHaptic('success');
+
+        // Credit referrer ONLY after user claims their 1st scratch card
+        creditReferralAfterFirstSpin(userRef.current.id);
+      }
+
+      setWonModal(null);
+
+      if (nextAction === 'wallet') {
+        onNavigate('wallet');
+        return;
+      }
+
+      // Reset card for next scratch after claiming
+      setIsScratched(false);
+      setIsScratching(false);
+      setHasClaimedCurrentCard(false);
+      hasTriggeredWinRef.current = false;
+      hasClaimedRef.current = false;
+      scratchStrokeCountRef.current = 0;
+      isPointerDownRef.current = false;
+      isScratchingRef.current = false;
+      lastPointRef.current = null;
+      setCardKey((prev) => prev + 1);
+    },
+    [winAmount, onNavigate]
+  );
 
   // -------------------------------------------------------------
   // Percentage Check: auto-reveal if enough foil is scratched
@@ -267,25 +318,19 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
   // -------------------------------------------------------------
   // HTML5 Pointer Events (Universal: Mobile Touch + Desktop Mouse)
+  // IMPORTANT: Does NOT deduct spin on touch! Spin is deducted ONLY on Claim!
   // -------------------------------------------------------------
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (isScratched || hasTriggeredWinRef.current) return;
 
-    // Check available spins
+    // Check available spins (without deducting yet!)
     if (userRef.current.spins <= 0) {
       triggerHaptic('error');
       setNoScratchesModal(true);
       return;
     }
 
-    // Deduct 1 scratch on initial touch
     if (!isScratchingRef.current) {
-      const decremented = decrementUserSpin(userRef.current.id);
-      if (!decremented) {
-        triggerHaptic('error');
-        setNoScratchesModal(true);
-        return;
-      }
       isScratchingRef.current = true;
       setIsScratching(true);
       triggerHaptic('medium');
@@ -322,22 +367,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const handleAutoScratch = () => {
     if (isScratched || hasTriggeredWinRef.current) return;
 
-    if (!isScratchingRef.current) {
-      if (userRef.current.spins <= 0) {
-        triggerHaptic('error');
-        setNoScratchesModal(true);
-        return;
-      }
-
-      const decremented = decrementUserSpin(userRef.current.id);
-      if (!decremented) {
-        triggerHaptic('error');
-        setNoScratchesModal(true);
-        return;
-      }
-      isScratchingRef.current = true;
+    if (userRef.current.spins <= 0) {
+      triggerHaptic('error');
+      setNoScratchesModal(true);
+      return;
     }
 
+    isScratchingRef.current = true;
     setIsScratching(true);
     triggerHaptic('heavy');
 
@@ -367,15 +403,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   };
 
   const handleScratchAgain = () => {
-    setWonModal(null);
-    setIsScratched(false);
-    setIsScratching(false);
-    hasTriggeredWinRef.current = false;
-    scratchStrokeCountRef.current = 0;
-    isPointerDownRef.current = false;
-    isScratchingRef.current = false;
-    lastPointRef.current = null;
-    setCardKey((prev) => prev + 1);
+    handleClaimReward('next_card');
   };
 
   return (
@@ -673,16 +701,20 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   </div>
                 )}
 
-                {/* Revealed state overlay with instant Scratch Next Card action */}
+                {/* Revealed state overlay with instant Claim / Scratch Next Card action */}
                 {isScratched && (
                   <div className="absolute inset-0 z-20 flex flex-col items-center justify-end pb-3 pointer-events-auto bg-black/20 backdrop-blur-[1px]">
                     <button
                       type="button"
-                      onClick={handleScratchAgain}
+                      onClick={() => handleClaimReward('next_card')}
                       className="bg-gradient-to-r from-emerald-500 via-green-500 to-emerald-600 hover:from-emerald-600 hover:to-green-600 active:scale-95 text-white font-['Outfit'] font-black text-xs px-5 py-2.5 rounded-full shadow-lg shadow-emerald-950/40 flex items-center gap-1.5 transition-all cursor-pointer border border-emerald-300"
                     >
-                      <RotateCcw className="w-3.5 h-3.5" />
-                      <span>Scratch Next Card 🚀</span>
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>
+                        {hasClaimedCurrentCard
+                          ? 'Scratch Next Card 🚀'
+                          : `Claim ₹${winAmount} & Next Card 🎁`}
+                      </span>
                     </button>
                   </div>
                 )}
@@ -741,19 +773,11 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       </div>
 
       {/* ------------------------------------------------------------- */}
-      {/* 5. CELEBRATION WON MODAL                                      */}
+      {/* 5. CELEBRATION WON MODAL (Strict Claim Gate)                  */}
       {/* ------------------------------------------------------------- */}
       {wonModal && (
         <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in">
           <div className="w-full max-w-sm bg-white rounded-[28px] p-6 shadow-2xl border border-white flex flex-col items-center text-center relative animate-scale-up">
-            <button
-              type="button"
-              onClick={() => setWonModal(null)}
-              className="absolute top-4 right-4 w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-500"
-            >
-              <X className="w-4 h-4" />
-            </button>
-
             {/* Glowing Icon */}
             <div className="w-20 h-20 rounded-full bg-gradient-to-tr from-amber-400 to-orange-500 flex items-center justify-center shadow-lg shadow-orange-500/40 text-4xl mb-3">
               🎉
@@ -772,41 +796,25 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             </div>
 
             <p className="text-slate-600 text-xs font-semibold leading-relaxed mb-5 max-w-[240px]">
-              ₹{wonModal.amount} has been added directly to your wallet balance!
+              Click <strong>Claim ₹{wonModal.amount} Cash</strong> below to add this reward to your wallet balance!
             </p>
 
             <div className="w-full space-y-2.5">
-              {user.spins > 0 ? (
-                <button
-                  type="button"
-                  onClick={handleScratchAgain}
-                  className="w-full bg-gradient-to-r from-[#ff5e00] to-[#ff7a00] hover:from-[#e55300] hover:to-[#f06e00] text-white font-['Outfit'] font-black text-sm py-3.5 rounded-2xl shadow-lg shadow-orange-500/35 active:scale-95 transition-all flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  <RotateCcw className="w-4 h-4" />
-                  <span>Scratch Again ({user.spins} Left) 🚀</span>
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setWonModal(null);
-                    onNavigate('invite');
-                  }}
-                  className="w-full bg-gradient-to-r from-[#ff5e00] to-[#ff7a00] hover:from-[#e55300] hover:to-[#f06e00] text-white font-['Outfit'] font-black text-sm py-3.5 rounded-2xl shadow-lg shadow-orange-500/35 active:scale-95 transition-all flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  <span>Get More Scratches (Invite Friends) 🤝</span>
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => handleClaimReward('next_card')}
+                className="w-full bg-gradient-to-r from-[#16a34a] to-[#22c55e] hover:from-[#15803d] hover:to-[#16a34a] text-white font-['Outfit'] font-black text-sm py-3.5 rounded-2xl shadow-lg shadow-emerald-600/35 active:scale-95 transition-all flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Sparkles className="w-4 h-4" />
+                <span>Claim ₹{wonModal.amount} Cash ✅</span>
+              </button>
 
               <button
                 type="button"
-                onClick={() => {
-                  setWonModal(null);
-                  onNavigate('wallet');
-                }}
+                onClick={() => handleClaimReward('wallet')}
                 className="w-full bg-slate-100 hover:bg-slate-200 text-slate-800 font-['Outfit'] font-bold text-xs py-3 rounded-2xl transition-all cursor-pointer"
               >
-                Go to Wallet &amp; Withdraw
+                Claim &amp; Go to Wallet
               </button>
             </div>
           </div>

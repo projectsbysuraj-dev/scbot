@@ -10,7 +10,12 @@ import {
 } from 'lucide-react';
 import { rtdb, ref, get, set, update } from '../services/firebase';
 import { triggerHaptic } from '../services/telegram';
-import { saveSingleUser } from '../services/store';
+import {
+  saveSingleUser,
+  RTDB_BASE_URL,
+  isUserIdBlockedLocally,
+  markUserIdBlockedLocally,
+} from '../services/store';
 
 interface DeviceVerificationScreenProps {
   user: UserProfile;
@@ -22,7 +27,7 @@ interface DeviceVerificationScreenProps {
 const DEVICE_STORAGE_KEY = 'rg_phone_registered_device_v1';
 const BOUND_TELEGRAM_ID_KEY = 'rg_bound_telegram_id_v1';
 const BOT_TOKEN = '8956392892:AAHHL_KxabHRt5_v3JYQGInzJhqNxDEUr5g';
-const MINI_APP_URL = 'https://trx-pi.vercel.app/';
+const MINI_APP_URL = 'https://scbot-ochre.vercel.app/';
 
 function getHardwareFingerprint(): string {
   try {
@@ -78,9 +83,20 @@ export function DeviceVerificationScreen({
       ? `${MINI_APP_URL}?start=ref_${referrerId.replace('ref_', '')}`
       : MINI_APP_URL;
 
-    // 1. Mark verified in Local Storage and Firebase RTDB
+    // 1. Mark verified in Local Storage and Firebase RTDB while ensuring 1 Sign Up Scratch Card is intact
+    const initialSpins =
+      typeof user.spins === 'number' && user.spins > 0
+        ? user.spins
+        : (user.balance || 0) === 0
+        ? 1
+        : 0;
+    const initialSpinsEarned = Math.max(user.spinsEarned || 0, 1);
+
     saveSingleUser({
       ...user,
+      spins: initialSpins,
+      spinsEarned: initialSpinsEarned,
+      claimedWelcomeSpin: true,
       isVerified: true,
       deviceVerified: true,
       deviceVerifiedAt: Date.now(),
@@ -89,6 +105,9 @@ export function DeviceVerificationScreen({
     if (rtdb && rawUserCleanId) {
       try {
         await update(ref(rtdb, `users/${rawUserCleanId}`), {
+          spins: initialSpins,
+          spinsEarned: initialSpinsEarned,
+          claimedWelcomeSpin: true,
           isVerified: true,
           deviceVerified: true,
           deviceVerifiedAt: Date.now(),
@@ -137,20 +156,77 @@ export function DeviceVerificationScreen({
     onContinue();
   };
 
-  const handleDoneBlocked = async () => {
-    triggerHaptic('error');
-    const rawUserCleanId = String(user.telegramId || user.id || '').trim();
+  const permanentlyLockFailedAccount = async (targetUserId: string, conflictOwnerId?: string | null) => {
+    const cleanId = String(targetUserId || '').trim();
+    if (!cleanId) return;
 
-    if (rtdb && rawUserCleanId) {
+    markUserIdBlockedLocally(cleanId);
+
+    const blockedPayload = {
+      deviceBlocked: true,
+      deviceBlockedAt: Date.now(),
+      isVerified: false,
+      deviceVerified: false,
+    };
+
+    saveSingleUser({
+      ...user,
+      id: cleanId,
+      telegramId: cleanId,
+      deviceBlocked: true,
+      isVerified: false,
+      deviceVerified: false,
+    });
+
+    try {
+      await Promise.all([
+        fetch(`${RTDB_BASE_URL}/users/${cleanId}.json`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(blockedPayload),
+        }),
+        fetch(`${RTDB_BASE_URL}/blocked_accounts/${cleanId}.json`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            blocked: true,
+            userId: cleanId,
+            conflictWith: conflictOwnerId || 'bound_device',
+            blockedAt: Date.now(),
+          }),
+        }),
+      ]);
+    } catch {
+      // Ignore network error
+    }
+
+    if (rtdb) {
       try {
-        await update(ref(rtdb, `users/${rawUserCleanId}`), {
-          deviceBlocked: true,
-          deviceBlockedAt: Date.now(),
-        });
+        await Promise.all([
+          update(ref(rtdb, `users/${cleanId}`), blockedPayload),
+          set(ref(rtdb, `blocked_accounts/${cleanId}`), {
+            blocked: true,
+            userId: cleanId,
+            conflictWith: conflictOwnerId || 'bound_device',
+            blockedAt: Date.now(),
+          }),
+        ]);
       } catch (e) {
         console.warn('Error recording blocked device status:', e);
       }
     }
+  };
+
+  const handleDoneBlocked = async () => {
+    triggerHaptic('error');
+    const tgUid =
+      (typeof window !== 'undefined' && (window as any).Telegram?.WebApp?.initDataUnsafe?.user?.id) ||
+      (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('uid')) ||
+      user.telegramId ||
+      user.id;
+    const rawUserCleanId = String(tgUid || '').trim();
+
+    await permanentlyLockFailedAccount(rawUserCleanId);
 
     if (typeof window !== 'undefined' && (window as any).Telegram?.WebApp?.close) {
       (window as any).Telegram.WebApp.close();
@@ -158,7 +234,20 @@ export function DeviceVerificationScreen({
   };
 
   useEffect(() => {
-    const currentTelegramId = String(user.telegramId || user.id).trim();
+    const tgUid =
+      (typeof window !== 'undefined' && (window as any).Telegram?.WebApp?.initDataUnsafe?.user?.id) ||
+      (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('uid')) ||
+      user.telegramId ||
+      user.id;
+    const currentTelegramId = String(tgUid || '').trim();
+
+    // Immediate check: if this ID is already marked blocked locally or in user profile, block immediately!
+    if (user.deviceBlocked || isUserIdBlockedLocally(currentTelegramId)) {
+      setSlideProgress(100);
+      setStatus('blocked');
+      permanentlyLockFailedAccount(currentTelegramId);
+      return;
+    }
 
     let localDeviceId = localStorage.getItem(DEVICE_STORAGE_KEY);
     if (!localDeviceId) {
@@ -196,17 +285,31 @@ export function DeviceVerificationScreen({
       // CHECK A: Is this phone's localStorage already bound to a DIFFERENT Telegram ID?
       if (boundLocalTelegramId && boundLocalTelegramId !== currentTelegramId) {
         triggerHaptic('error');
+        permanentlyLockFailedAccount(currentTelegramId, boundLocalTelegramId);
         setStatus('blocked');
         return;
       }
 
-      // CHECK B: Double-check with Firebase RTDB device & hardware bindings
+      // CHECK B: Double-check with Firebase RTDB user block status, device & hardware bindings
       if (rtdb) {
         Promise.all([
+          currentTelegramId ? get(ref(rtdb, `users/${currentTelegramId}`)) : Promise.resolve(null),
+          currentTelegramId ? get(ref(rtdb, `blocked_accounts/${currentTelegramId}`)) : Promise.resolve(null),
           localDeviceId ? get(ref(rtdb, `devices/${localDeviceId}`)) : Promise.resolve(null),
           hwFingerprint ? get(ref(rtdb, `hardware_fingerprints/${hwFingerprint}`)) : Promise.resolve(null),
         ])
-          .then(([deviceSnap, hwSnap]) => {
+          .then(([userSnap, blockedSnap, deviceSnap, hwSnap]) => {
+            // 1. Check if this account was EVER blocked before
+            if (
+              (userSnap && userSnap.exists() && userSnap.val()?.deviceBlocked === true) ||
+              (blockedSnap && blockedSnap.exists() && (blockedSnap.val() === true || blockedSnap.val()?.blocked === true))
+            ) {
+              triggerHaptic('error');
+              permanentlyLockFailedAccount(currentTelegramId, 'previously_blocked');
+              setStatus('blocked');
+              return;
+            }
+
             let conflictId: string | null = null;
 
             if (deviceSnap && deviceSnap.exists()) {
@@ -228,6 +331,7 @@ export function DeviceVerificationScreen({
             if (conflictId) {
               triggerHaptic('error');
               localStorage.setItem(BOUND_TELEGRAM_ID_KEY, conflictId);
+              permanentlyLockFailedAccount(currentTelegramId, conflictId);
               setStatus('blocked');
               return;
             }
@@ -256,6 +360,11 @@ export function DeviceVerificationScreen({
             setStatus('success');
           })
           .catch(() => {
+            if (isUserIdBlockedLocally(currentTelegramId) || user.deviceBlocked) {
+              triggerHaptic('error');
+              setStatus('blocked');
+              return;
+            }
             localStorage.setItem(BOUND_TELEGRAM_ID_KEY, currentTelegramId);
             triggerHaptic('success');
             setStatus('success');

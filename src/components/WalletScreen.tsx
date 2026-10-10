@@ -225,12 +225,12 @@ export const WalletScreen: React.FC<WalletScreenProps> = ({ user, settings, onNa
           <button
             type="button"
             onClick={() => onNavigate('home')}
-            className="bg-[#f8fafc] hover:bg-slate-100 text-slate-800 font-['Outfit'] font-extrabold text-xs sm:text-sm py-3.5 rounded-full border border-slate-200/90 flex items-center justify-center gap-2 active:scale-95 transition-all cursor-pointer shadow-xs"
+            className="bg-[#f8fafc] hover:bg-slate-100 text-slate-800 font-['Outfit'] font-extrabold text-xs sm:text-sm py-3.5 rounded-full border border-slate-200/90 flex items-center justify-center gap-1.5 active:scale-95 transition-all cursor-pointer shadow-xs"
           >
-            <span className="w-5 h-4 rounded bg-gradient-to-r from-[#16a34a] to-[#22c55e] text-white font-['Outfit'] font-black text-[10px] flex items-center justify-center -rotate-12 shadow-xs">
+            <span className="w-5 h-4 rounded bg-gradient-to-r from-[#16a34a] to-[#22c55e] text-white font-['Outfit'] font-black text-[10px] flex items-center justify-center -rotate-12 shadow-xs shrink-0">
               ₹
             </span>
-            <span>Go to Scratch</span>
+            <span className="truncate">Win Up to ₹50</span>
           </button>
         </div>
       </div>

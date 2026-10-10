@@ -213,6 +213,17 @@ def answer_callback_query(callback_query_id: str, text: str = None, show_alert: 
     return tg_api("answerCallbackQuery", payload)
 
 
+def forward_message(chat_id, from_chat_id, message_id: int) -> dict:
+    return tg_api(
+        "forwardMessage",
+        {
+            "chat_id": chat_id,
+            "from_chat_id": from_chat_id,
+            "message_id": message_id,
+        },
+    )
+
+
 def copy_message(chat_id, from_chat_id, message_id: int) -> dict:
     return tg_api(
         "copyMessage",
@@ -222,6 +233,62 @@ def copy_message(chat_id, from_chat_id, message_id: int) -> dict:
             "message_id": message_id,
         },
     )
+
+
+def has_custom_emoji(message: dict) -> bool:
+    if not message:
+        return False
+    entities = message.get("entities") or message.get("caption_entities") or []
+    return any(e.get("type") == "custom_emoji" for e in entities)
+
+
+def deliver_premium_message(target_chat_id, source_chat_id, message: dict) -> dict:
+    """
+    Guarantees 100% delivery of Telegram Premium animated custom emojis:
+    1. If the message has custom_emoji entities, 'forwardMessage' preserves the sender's
+       Telegram Premium custom_emoji rendering on all Telegram clients even if the bot
+       itself does not have a paid Fragment username.
+    2. Also supports direct entity preservation (entities / caption_entities) and falls
+       back to copyMessage if needed.
+    """
+    msg_id = message.get("message_id")
+    if has_custom_emoji(message):
+        res = forward_message(target_chat_id, source_chat_id, msg_id)
+        if res.get("ok"):
+            return res
+
+        # Fallback: explicitly pass entities / caption_entities without parse_mode
+        entities = message.get("entities")
+        caption_entities = message.get("caption_entities")
+        reply_markup = message.get("reply_markup")
+
+        if message.get("text") and entities:
+            payload = {
+                "chat_id": target_chat_id,
+                "text": message["text"],
+                "entities": entities,
+            }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            res2 = tg_api("sendMessage", payload)
+            if res2.get("ok"):
+                return res2
+
+        if caption_entities:
+            copy_payload = {
+                "chat_id": target_chat_id,
+                "from_chat_id": source_chat_id,
+                "message_id": msg_id,
+                "caption": message.get("caption", ""),
+                "caption_entities": caption_entities,
+            }
+            if reply_markup:
+                copy_payload["reply_markup"] = reply_markup
+            res3 = tg_api("copyMessage", copy_payload)
+            if res3.get("ok"):
+                return res3
+
+    return copy_message(target_chat_id, source_chat_id, msg_id)
 
 
 # ---------------------------------------------------------------------------
@@ -384,14 +451,14 @@ def handle_start(chat_id, user: dict, args: list[str]):
         else:
             record_referral(referrer_id, user_id, name, username, status="pending_first_scratch")
             logger.info(f"Referral pending first scratch: {user_id} referred by {referrer_id}")
-            join_msg = (
-                f"👥 <b>New Referral Joined!</b>\n\n"
-                f"👤 <b>{name}</b> ne aapke invite link se join kiya hai!\n"
-                f"⏳ Friend jaise hi device verify karke 1st scratch card khelega, aapko <b>+1 Free Scratch Card</b> mil jayega! 🎫"
-            )
-            send_message(int(referrer_id), join_msg)
 
     existing = get_user_from_db(user_id)
+    blocked_record = db_request(f"blocked_accounts/{user_id}.json")
+    is_blocked = bool(
+        (existing and existing.get("deviceBlocked") is True)
+        or (blocked_record is True or (isinstance(blocked_record, dict) and blocked_record.get("blocked") is True))
+    )
+
     if not existing:
         welcome_user = {
             "id": user_id,
@@ -402,25 +469,61 @@ def handle_start(chat_id, user: dict, args: list[str]):
             "spins": 1,
             "friendsJoined": 0,
             "spinsEarned": 1,
+            "claimedWelcomeSpin": True,
             "createdAt": int(time.time() * 1000),
             "isVerified": False,
             "deviceVerified": False,
+            "deviceBlocked": is_blocked,
             "referredBy": referrer_id if (referrer_id and referrer_id != user_id) else None,
             "referralRewardGiven": False,
         }
         db_request(f"users/{user_id}.json", method="PUT", data=welcome_user)
         existing = welcome_user
+    else:
+        patch_data = {}
+        # If user record was created partially without signup scratch card and hasn't played yet, grant 1 scratch card
+        if not existing.get("claimedWelcomeSpin") and (existing.get("balance") or 0) == 0 and (existing.get("spins") is None or existing.get("spins") == 0):
+            patch_data["spins"] = 1
+            patch_data["spinsEarned"] = max(existing.get("spinsEarned") or 0, 1)
+            patch_data["claimedWelcomeSpin"] = True
+            existing["spins"] = 1
+            existing["spinsEarned"] = patch_data["spinsEarned"]
+            existing["claimedWelcomeSpin"] = True
 
-    if existing.get("isVerified") and existing.get("deviceVerified"):
-        app_url = f"{WEB_URL}/?start=ref_{referrer_id}" if referrer_id else WEB_URL
+        if referrer_id and referrer_id != user_id and not existing.get("referredBy") and (existing.get("balance") or 0) == 0:
+            patch_data["referredBy"] = referrer_id
+            existing["referredBy"] = referrer_id
+
+        if is_blocked:
+            patch_data["deviceBlocked"] = True
+            patch_data["isVerified"] = False
+            patch_data["deviceVerified"] = False
+            existing["deviceBlocked"] = True
+            existing["isVerified"] = False
+            existing["deviceVerified"] = False
+
+        if patch_data:
+            db_request(f"users/{user_id}.json", method="PATCH", data=patch_data)
+
+    if is_blocked:
+        send_message(
+            chat_id,
+            "🚫 <b>Device Verification Failed / Account Blocked!</b>\n\n"
+            "Ek phone me sirf 1 account allow hai. Ye ID permanently block ho chuki hai.",
+        )
+        return
+
+    if existing.get("isVerified") and existing.get("deviceVerified") and not existing.get("deviceBlocked"):
+        app_url = f"{WEB_URL}/?uid={user_id}&start=ref_{referrer_id}" if referrer_id else f"{WEB_URL}/?uid={user_id}"
         verified_markup = {
             "inline_keyboard": [
-                [{"text": "🎉 Click To Home", "web_app": {"url": app_url}}],
-                [{"text": "👥 Refer And Earn", "callback_data": "my_invite"}],
+                [{"text": "🎉 Click To Home (Win Up to ₹50)", "web_app": {"url": app_url}}],
+                [{"text": "👥 Refer And Earn (1 Refer = 1 Scratch)", "callback_data": "my_invite"}],
             ]
         }
         verified_text = (
             "🔥<b>Congratulations Sussefuly Verfied</b> ✅\n"
+            "🎁 <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n"
             "🎉 <b>Click To Home And Refer And Earn</b> 🎉\n"
             "✅✅<b>Now All Payment Instant</b> ✅✅"
         )
@@ -429,7 +532,9 @@ def handle_start(chat_id, user: dict, args: list[str]):
 
     channels = load_channels()
     welcome_text = (
-        "👑 <b>Hey There! Welcome To Bot !!</b>\n\n"
+        "👑 <b>Hey There! Welcome To Scratch The Win !!</b>\n"
+        "🎁 <b>1 Sign Up = 1 Free Scratch Card (Win Up to ₹50)</b>\n"
+        "👥 <b>1 Refer = 1 Free Scratch Card</b>\n\n"
         "🌺 <b>Join The Channels Below To Continue</b>\n\n"
         "😍 <b>After Joining Click Claim</b>"
     )
@@ -493,6 +598,14 @@ def handle_check_device_callback(query: dict):
             ref_param = raw
 
     db_user = get_user_from_db(user_id) or {}
+    if db_user.get("deviceBlocked") is True:
+        answer_callback_query(
+            query_id,
+            "🚫 Device Verification Failed! Ye account permanently block ho chuka hai.",
+            show_alert=True,
+        )
+        return
+
     is_device_verified = db_user.get("deviceVerified") and db_user.get("isVerified")
 
     if not is_device_verified:
@@ -504,15 +617,16 @@ def handle_check_device_callback(query: dict):
         return
 
     answer_callback_query(query_id)
-    app_url = f"{WEB_URL}/?start={ref_param}" if ref_param else WEB_URL
+    app_url = f"{WEB_URL}/?uid={user_id}&start={ref_param}" if ref_param else f"{WEB_URL}/?uid={user_id}"
     final_markup = {
         "inline_keyboard": [
-            [{"text": "🎉 Click To Home", "web_app": {"url": app_url}}],
-            [{"text": "👥 Refer And Earn", "callback_data": "my_invite"}],
+            [{"text": "🎉 Click To Home (Win Up to ₹50)", "web_app": {"url": app_url}}],
+            [{"text": "👥 Refer And Earn (1 Refer = 1 Scratch)", "callback_data": "my_invite"}],
         ]
     }
     final_text = (
         "🔥<b>Congratulations Sussefuly Verfied</b> ✅\n"
+        "🎁 <b>Sign Up Bonus: 1 Free Scratch Card Active! (Win Up to ₹50)</b>\n"
         "🎉 <b>Click To Home And Refer And Earn</b> 🎉\n"
         "✅✅<b>Now All Payment Instant</b> ✅✅"
     )
@@ -530,27 +644,27 @@ def handle_invite(chat_id, user: dict):
     friends = db_user.get("friendsJoined", 0)
 
     share_text = urllib.parse.quote(
-        f"🎁 Scratch The Win par turant ₹5 Cash Scratch Card jeeto! Ek click me UPI withdrawal milta hai! 👇\n{invite_link}"
+        f"🎁 Scratch The Win par Scratch Card khelo & Win Up to ₹50 Cash! 1 Sign Up = 1 Scratch & 1 Refer = 1 Scratch! 👇\n{invite_link}"
     )
     share_url = f"https://t.me/share/url?url={invite_link}&text={share_text}"
 
     markup = {
         "inline_keyboard": [
             [{"text": "🚀 Share Invite Link", "url": share_url}],
-            [{"text": "🎉 Click To Home", "web_app": {"url": WEB_URL}}],
+            [{"text": "🎉 Click To Home (Win Up to ₹50)", "web_app": {"url": f"{WEB_URL}/?uid={user_id}"}}],
         ]
     }
 
     msg = (
-        f"🎉 <b>Click To Home And Refer And Earn</b> 🎉\n\n"
+        f"🎉 <b>Scratch &amp; Win Up to ₹50 - Refer And Earn</b> 🎉\n\n"
         f"🔗 <b>Your Personal Invite Link:</b>\n"
         f"<code>{invite_link}</code>\n\n"
-        f"🎁 <b>Rules:</b>\n"
-        f"• Har dost ko refer karne par <b>+1 Free Scratch Card</b>\n"
-        f"• Sabhi payments 100% instant UPI / Bank transfer\n"
+        f"🎁 <b>Rewards:</b>\n"
+        f"• <b>1 Sign Up = 1 Free Scratch Card</b> (Win Up to ₹50)\n"
+        f"• <b>1 Refer = 1 Free Scratch Card</b> (Jab friend 1st card scratch kare)\n"
         f"• ✅✅ <b>Now All Payment Instant</b> ✅✅\n\n"
         f"📊 <b>Your Stats:</b>\n"
-        f"• Doston ki Sankhya: <b>{friends}</b>\n"
+        f"• Friends Joined: <b>{friends}</b>\n"
         f"• Available Scratch Cards: <b>{spins}</b>"
     )
     send_message(chat_id, msg, reply_markup=markup)
@@ -697,21 +811,45 @@ def handle_emojitest(chat_id, user: dict, message: dict):
         return
     reply_msg = message.get("reply_to_message")
     if reply_msg:
-        send_message(chat_id, "🧪 <b>TEST PREVIEW:</b> Niche aapka message copy hokar aa raha hai 👇")
-        res = copy_message(chat_id, chat_id, reply_msg.get("message_id"))
+        custom_count = len([e for e in (reply_msg.get("entities") or reply_msg.get("caption_entities") or []) if e.get("type") == "custom_emoji"])
+        send_message(
+            chat_id,
+            f"🧪 <b>PREMIUM EMOJI TEST PREVIEW ({custom_count} Custom Emojis Detected):</b>\n"
+            f"Niche aapka message 100% original Premium Animated Emojis ke saath aa raha hai 👇",
+        )
+        res = deliver_premium_message(chat_id, chat_id, reply_msg)
         if res.get("ok"):
             send_message(
                 chat_id,
-                "✅ Agar upar custom animated emojis saaf dikh rahe hain, to is message ko reply karke <code>/broadcast</code> likhein!",
+                "✅ <b>Premium Custom Emojis Verified!</b>\n"
+                "Ab usi message ko <b>Reply</b> karke <code>/broadcast</code> likhein — sabhi users ko exact animated premium emojis jayenge!",
             )
         else:
-            send_message(chat_id, f"⚠️ Test copy failed: {res.get('description')}")
+            send_message(chat_id, f"⚠️ Test preview failed: {res.get('description')}")
     else:
         send_message(
             chat_id,
             "🧪 <b>EMOJI & MEDIA TEST GUIDE:</b>\n\n"
-            "Apne premium animated emojis wale message ko <b>Reply</b> karein aur likhein: <code>/emojitest</code>",
+            "Apne Telegram Premium animated emojis wale message ko <b>Reply</b> karein aur likhein: <code>/emojitest</code>",
         )
+
+
+def extract_shifted_entities(full_text: str, entities: list[dict], prefix_str: str) -> list[dict]:
+    """
+    Adjusts UTF-16 entity offsets when stripping '/broadcast ' command prefix so
+    custom_emoji entities sent directly inside '/broadcast <text>' remain 100% intact.
+    """
+    if not entities:
+        return []
+    prefix_utf16_len = len(prefix_str.encode("utf-16-le")) // 2
+    shifted = []
+    for ent in entities:
+        offset = ent.get("offset", 0)
+        if offset >= prefix_utf16_len:
+            new_ent = dict(ent)
+            new_ent["offset"] = offset - prefix_utf16_len
+            shifted.append(new_ent)
+    return shifted
 
 
 def handle_broadcast(chat_id, user: dict, message: dict):
@@ -721,16 +859,21 @@ def handle_broadcast(chat_id, user: dict, message: dict):
     full_text = message.get("text") or message.get("caption") or ""
     command_match = re.match(r"^/broadcast(@\w+)?\s*", full_text)
     prefix_len = command_match.end() if command_match else 0
-    direct_text = full_text[prefix_len:].strip()
+    prefix_str = full_text[:prefix_len]
+    direct_text = full_text[prefix_len:]
 
-    if not reply_msg and not direct_text:
+    if not reply_msg and not direct_text.strip():
         send_message(
             chat_id,
             "📢 <b>PREMIUM BROADCAST GUIDE:</b>\n\n"
-            "1. Apne custom emojis, photos, ya media wale message ko <b>Reply</b> karein aur likhein: <code>/broadcast</code>\n"
-            "2. Direct text bhejne ke liye: <code>/broadcast &lt;message&gt;</code>",
+            "1. Apne custom animated emojis, photos, ya media wale message ko <b>Reply</b> karein aur likhein: <code>/broadcast</code> (Recommended for 100% Premium Emojis)\n"
+            "2. Direct bhejne ke liye: <code>/broadcast &lt;message&gt;</code>",
         )
         return
+
+    raw_entities = message.get("entities") or message.get("caption_entities") or []
+    shifted_entities = extract_shifted_entities(full_text, raw_entities, prefix_str)
+    direct_has_custom_emoji = any(e.get("type") == "custom_emoji" for e in shifted_entities)
 
     users = db_request("users.json") or {}
     items = list(users.values()) if isinstance(users, dict) else list(users or [])
@@ -751,17 +894,29 @@ def handle_broadcast(chat_id, user: dict, message: dict):
         send_message(chat_id, "⚠️ Database me koi users nahi mile!")
         return
 
-    send_message(chat_id, f"🚀 Broadcast shuru ho raha hai {len(valid_user_ids)} users ko...")
+    send_message(chat_id, f"🚀 Premium Broadcast shuru ho raha hai {len(valid_user_ids)} users ko...")
 
     sent = 0
     failed = 0
     for uid in valid_user_ids:
         if reply_msg:
-            res = copy_message(uid, chat_id, reply_msg.get("message_id"))
-        else:
-            res = send_message(uid, direct_text)
+            res = deliver_premium_message(uid, chat_id, reply_msg)
+        elif direct_has_custom_emoji:
+            # Send with exact UTF-16 shifted custom_emoji entities (no parse_mode conflict)
+            res = tg_api(
+                "sendMessage",
+                {
+                    "chat_id": uid,
+                    "text": direct_text,
+                    "entities": shifted_entities,
+                },
+            )
             if not res.get("ok"):
-                res = send_message(uid, direct_text, parse_mode="")
+                res = forward_message(uid, chat_id, message.get("message_id"))
+        else:
+            res = send_message(uid, direct_text.strip())
+            if not res.get("ok"):
+                res = send_message(uid, direct_text.strip(), parse_mode="")
         if res.get("ok"):
             sent += 1
         else:

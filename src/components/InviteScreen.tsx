@@ -62,7 +62,7 @@ export const InviteScreen: React.FC<InviteScreenProps> = ({ user, settings }) =>
   const handleShareTelegram = () => {
     triggerHaptic('medium');
     const text = encodeURIComponent(
-      `🎁 Join ${settings.appTitle || 'Scratch The Win'}! Scratch the card and win instant real cash directly into your UPI/Bank! 100% Guaranteed Cash Win!`
+      `🎁 Join ${settings.appTitle || 'Scratch The Win'}! Scratch the card & Win Up to ₹50 instant real cash directly into your UPI/Bank! 100% Guaranteed Cash Win!`
     );
     const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(botReferralLink)}&text=${text}`;
     openExternalOrTelegramLink(shareUrl);
@@ -109,11 +109,14 @@ export const InviteScreen: React.FC<InviteScreenProps> = ({ user, settings }) =>
           <div className="relative z-10 flex items-center justify-between gap-2">
             {/* Left Copy */}
             <div className="flex-1 min-w-0 pr-1">
+              <div className="inline-flex items-center gap-1 bg-emerald-50 border border-emerald-200 text-[#16a34a] font-['Outfit'] font-black text-[10px] px-2.5 py-0.5 rounded-full mb-1">
+                <span>Win Up to ₹50 Per Scratch</span>
+              </div>
               <h2 className="font-['Outfit'] font-black text-[#0f291e] text-[22px] sm:text-2xl tracking-tight leading-tight">
                 Invite Friends
               </h2>
               <h3 className="font-['Outfit'] font-black text-[#ea580c] text-[20px] sm:text-[22px] tracking-tight leading-tight mb-2">
-                &amp; Get Scratch Cards
+                &amp; Win Up to ₹50
               </h3>
               <p className="text-slate-600 text-[11px] sm:text-xs font-semibold leading-snug">
                 Get <strong className="text-slate-800">1 Scratch Card</strong> for every friend who joins!

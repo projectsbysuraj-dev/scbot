@@ -86,7 +86,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({
 
       {/* ----------------- 3. QUICK ACTIONS CARD (MATCHING SCREENSHOT) ----------------- */}
       <div className="w-full bg-white rounded-[32px] p-2 shadow-md shadow-slate-900/5 border border-slate-100 divide-y divide-slate-100 overflow-hidden">
-        {/* Row 1: Lucky Spin Wheel */}
+        {/* Row 1: Scratch & Win (Win Up to ₹50) */}
         <button
           type="button"
           onClick={() => {
@@ -96,17 +96,17 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({
           className="w-full p-4 flex items-center justify-between text-left hover:bg-slate-50/80 rounded-2xl transition-all cursor-pointer active:scale-[0.99]"
         >
           <div className="flex items-center gap-3.5">
-            <span className="text-2xl shrink-0 leading-none" role="img" aria-label="spin">
-              🎡
+            <span className="text-2xl shrink-0 leading-none" role="img" aria-label="scratch">
+              🎫
             </span>
             <span className="font-['Outfit'] font-bold text-slate-800 text-[15px]">
-              Lucky Spin Wheel
+              Scratch &amp; Win (Win Up to ₹50)
             </span>
           </div>
           <ChevronRight className="w-5 h-5 text-slate-400 stroke-[2.2]" />
         </button>
 
-        {/* Row 2: Refer Friends (1 Refer = 1 Spin) */}
+        {/* Row 2: Refer Friends (1 Refer = 1 Scratch) */}
         <button
           type="button"
           onClick={() => {
@@ -120,7 +120,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({
               🤝
             </span>
             <span className="font-['Outfit'] font-bold text-slate-800 text-[15px]">
-              Refer Friends (1 Refer = 1 Spin)
+              Refer Friends (1 Refer = 1 Scratch)
             </span>
           </div>
           <ChevronRight className="w-5 h-5 text-slate-400 stroke-[2.2]" />

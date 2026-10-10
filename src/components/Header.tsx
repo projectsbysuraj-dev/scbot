@@ -80,6 +80,9 @@ export const Header: React.FC<HeaderProps> = ({
               <h1 className="font-['Outfit'] font-black text-slate-900 text-base sm:text-lg tracking-tight leading-tight truncate">
                 Scratch The Win
               </h1>
+              <span className="text-[10px] font-extrabold text-[#16a34a] block leading-none">
+                Win Up to ₹50
+              </span>
             </div>
           </div>
 

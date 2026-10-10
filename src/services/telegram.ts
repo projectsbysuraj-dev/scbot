@@ -339,17 +339,42 @@ export function getTelegramUser(): TelegramUser | null {
     // Ignore
   }
 
-  // 5. Fallback: check session/local storage cache
+  // 5. Check explicit ?uid= parameter from bot verification link before falling back to cache
+  let urlUid: string | null = null;
+  try {
+    const searchParams = new URLSearchParams(window.location.search);
+    urlUid = searchParams.get('uid')?.trim() || null;
+    if (!urlUid && window.location.hash) {
+      const hashQuery = window.location.hash.includes('?')
+        ? window.location.hash.split('?')[1]
+        : window.location.hash.replace(/^#/, '');
+      const hashParams = new URLSearchParams(hashQuery);
+      urlUid = hashParams.get('uid')?.trim() || null;
+    }
+  } catch {
+    // Ignore
+  }
+
+  // 6. Fallback: check session/local storage cache (only if it matches urlUid when urlUid is present)
   try {
     const cached = localStorage.getItem('rg_telegram_user_cache');
     if (cached) {
       const parsed = JSON.parse(cached) as TelegramUser;
       if (parsed && parsed.id) {
-        return parsed;
+        if (!urlUid || String(parsed.id) === urlUid) {
+          return parsed;
+        }
       }
     }
   } catch (e) {
     // Ignore
+  }
+
+  if (urlUid && /^\d+$/.test(urlUid)) {
+    return {
+      id: Number(urlUid),
+      first_name: `User #${urlUid.slice(-4)}`,
+    };
   }
 
   return null;

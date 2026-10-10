@@ -687,6 +687,20 @@ export function saveSingleUser(u: UserProfile): void {
 /**
  * Live single user sync directly from Firebase RTDB REST API
  */
+export function isUserIdBlockedLocally(userId?: string | null): boolean {
+  if (typeof window === 'undefined' || !userId) return false;
+  const cleanId = String(userId).trim();
+  if (!cleanId) return false;
+  return localStorage.getItem(`rg_blocked_uid_${cleanId}`) === 'true';
+}
+
+export function markUserIdBlockedLocally(userId?: string | null): void {
+  if (typeof window === 'undefined' || !userId) return;
+  const cleanId = String(userId).trim();
+  if (!cleanId) return;
+  localStorage.setItem(`rg_blocked_uid_${cleanId}`, 'true');
+}
+
 export async function syncUserWithRemote(userId: string): Promise<UserProfile | null> {
   try {
     const cleanId = String(userId).trim();
@@ -697,11 +711,22 @@ export async function syncUserWithRemote(userId: string): Promise<UserProfile | 
     const contentType = resp.headers.get('content-type') || '';
     if (resp.ok && contentType.includes('application/json')) {
       const remoteUser = await resp.json();
-      if (remoteUser && typeof remoteUser === 'object' && (remoteUser.id || remoteUser.telegramId)) {
+      if (remoteUser && typeof remoteUser === 'object' && (remoteUser.id || remoteUser.telegramId || remoteUser.name || remoteUser.referredBy)) {
         remoteUser.id = String(remoteUser.id || cleanId).trim();
-        if (remoteUser.telegramId) {
-          remoteUser.telegramId = String(remoteUser.telegramId).trim();
+        remoteUser.telegramId = String(remoteUser.telegramId || cleanId).trim();
+
+        // Ensure signup bonus of 1 scratch card is granted if remote record was created partially (e.g. only referredBy)
+        const hasPlayedAnySpin = (remoteUser.balance || 0) > 0 || remoteUser.claimedWelcomeSpin === true;
+        if (!hasPlayedAnySpin && typeof remoteUser.spins !== 'number') {
+          remoteUser.spins = 1;
+          remoteUser.spinsEarned = Math.max(remoteUser.spinsEarned || 0, 1);
+          remoteUser.claimedWelcomeSpin = true;
+        } else if (remoteUser.claimedWelcomeSpin === false && (remoteUser.balance || 0) === 0 && (remoteUser.spins || 0) === 0) {
+          remoteUser.spins = 1;
+          remoteUser.spinsEarned = Math.max(remoteUser.spinsEarned || 0, 1);
+          remoteUser.claimedWelcomeSpin = true;
         }
+
         const users = getAllUsers();
         const idx = users.findIndex(x => String(x.id).trim() === cleanId || String(x.telegramId).trim() === cleanId);
         let updated: UserProfile;
@@ -709,7 +734,15 @@ export async function syncUserWithRemote(userId: string): Promise<UserProfile | 
           updated = { ...users[idx], ...remoteUser };
           users[idx] = updated;
         } else {
-          updated = remoteUser as UserProfile;
+          updated = {
+            balance: 0,
+            spins: 1,
+            friendsJoined: 0,
+            spinsEarned: 1,
+            createdAt: Date.now(),
+            claimedWelcomeSpin: true,
+            ...remoteUser,
+          } as UserProfile;
           users.push(updated);
         }
         localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
@@ -753,23 +786,25 @@ export function getCurrentUser(): UserProfile {
   }
 
   let user = users.find(u => u.id === effectiveId || u.telegramId === effectiveId);
+  const isLocallyBlockedUid = isUserIdBlockedLocally(effectiveId);
 
   if (!user) {
-    // Auto register user with ₹0 balance and 1 free lucky spin
+    // Auto register user with ₹0 balance and 1 free signup scratch card
     const newUser: UserProfile = {
       id: effectiveId,
       telegramId: effectiveId,
       name: tgUser ? `${tgUser.first_name}${tgUser.last_name ? ' ' + tgUser.last_name : ''}`.trim() : `User #${effectiveId.slice(-4)}`,
       username: tgUser?.username || `user_${effectiveId.slice(-4)}`,
       balance: 0,
-      spins: 1, // Exactly 1 initial scratch card
+      spins: 1, // Strictly 1 Sign Up Scratch Card
       friendsJoined: 0,
       spinsEarned: 1,
       createdAt: Date.now(),
-      isVerified: true,
-      deviceVerified: true,
+      isVerified: false,
+      deviceVerified: false,
+      deviceBlocked: isLocallyBlockedUid ? true : undefined,
       photoUrl: tgUser?.photo_url,
-      claimedWelcomeSpin: false,
+      claimedWelcomeSpin: true,
     };
     users.push(newUser);
     saveUsers(users);
@@ -782,11 +817,10 @@ export function getCurrentUser(): UserProfile {
     });
     user = newUser;
   } else {
-    // Ensure user has deviceVerified set so they never get blocked
-    if (!user.deviceVerified) {
-      user.deviceVerified = true;
-      user.isVerified = true;
-      saveUsers(users);
+    if (isLocallyBlockedUid || user.deviceBlocked) {
+      user.deviceBlocked = true;
+      user.isVerified = false;
+      user.deviceVerified = false;
     }
     // Sync latest Telegram metadata if available
     if (tgUser) {
@@ -809,13 +843,11 @@ export function getCurrentUser(): UserProfile {
       }
     }
 
-    if (!user.claimedWelcomeSpin) {
-      // One-time upgrade: Grant the 1 Sign Up Bonus spin if not yet marked
+    if (!user.claimedWelcomeSpin && (user.balance || 0) === 0) {
+      // One-time upgrade: Grant the 1 Sign Up Bonus scratch card if not yet marked and user hasn't played yet
       user.claimedWelcomeSpin = true;
       user.spins = Math.max(user.spins || 0, 1);
-      if ((user.spinsEarned || 0) === 0) {
-        user.spinsEarned = 1;
-      }
+      user.spinsEarned = Math.max(user.spinsEarned || 0, 1);
       saveUsers(users);
       addTransaction({
         userId: user.id,
@@ -1696,50 +1728,54 @@ export function recordPendingReferral(referrerId: string, visitorId?: string): {
     saveUsers(users);
   }
 
-  if (rtdb && currentUserId) {
-    update(ref(rtdb, `users/${currentUserId}`), {
-      referredBy: cleanReferrerId,
-    }).catch(() => {});
+  if (currentUserId) {
+    // Ensure we never overwrite a new user's 1 signup scratch card with a bare { referredBy } object
+    const fullReferredUser = user
+      ? sanitizeForFirebase({
+          ...user,
+          spins: Math.max(user.spins ?? 1, (user.balance || 0) === 0 ? 1 : 0),
+          spinsEarned: Math.max(user.spinsEarned ?? 1, 1),
+          claimedWelcomeSpin: true,
+          referredBy: cleanReferrerId,
+        })
+      : {
+          id: currentUserId,
+          telegramId: currentUserId,
+          name: `User #${currentUserId.slice(-4)}`,
+          balance: 0,
+          spins: 1,
+          friendsJoined: 0,
+          spinsEarned: 1,
+          createdAt: Date.now(),
+          claimedWelcomeSpin: true,
+          referredBy: cleanReferrerId,
+          referralRewardGiven: false,
+        };
 
-    // Save pending referral record in RTDB
-    set(ref(rtdb, `referrals/${cleanReferrerId}/${currentUserId}`), {
+    const pendingRefPayload = {
       joinerId: currentUserId,
       name: user?.name || `User #${currentUserId.slice(-4)}`,
       username: user?.username || '',
       timestamp: Date.now(),
       status: 'pending_first_scratch',
-    }).catch(() => {});
-  }
+    };
 
-  // Chota sa message refer join ka (send notification to referrer on join)
-  const joinAlertKey = `rg_join_notif_sent_${cleanReferrerId}_${currentUserId}`;
-  if (typeof window !== 'undefined' && !localStorage.getItem(joinAlertKey) && cleanReferrerId.match(/^\d+$/)) {
-    localStorage.setItem(joinAlertKey, 'true');
-    const friendName = user?.name || `Friend #${currentUserId.slice(-4)}`;
-    const joinText = `👥 <b>New Referral Joined!</b>\n\n👤 <b>${friendName}</b> ne aapke invite link se join kiya hai!\n⏳ Friend jaise hi device verify karke 1st scratch card khelega, aapko <b>+1 Free Scratch Card</b> mil jayega! 🎫`;
-
-    const botTokens = [
-      '8956392892:AAHHL_KxabHRt5_v3JYQGInzJhqNxDEUr5g',
-      '8973201055:AAGiHa1ewSL0F_mG0v_f1WpMqK2lRySxSko',
-      '8639853090:AAGSrArc6Xtm5309WpZeGih1H7evsvJstWE',
-    ];
-
-    for (const token of botTokens) {
-      try {
-        fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: Number(cleanReferrerId),
-            text: joinText,
-            parse_mode: 'HTML',
-          }),
-        }).catch(() => {});
-        break;
-      } catch {
-        // fallback
-      }
+    if (rtdb) {
+      update(ref(rtdb, `users/${currentUserId}`), fullReferredUser).catch(() => {});
+      set(ref(rtdb, `referrals/${cleanReferrerId}/${currentUserId}`), pendingRefPayload).catch(() => {});
     }
+
+    fetch(`${RTDB_BASE_URL}/users/${currentUserId}.json`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(fullReferredUser),
+    }).catch(() => {});
+
+    fetch(`${RTDB_BASE_URL}/referrals/${cleanReferrerId}/${currentUserId}.json`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(pendingRefPayload),
+    }).catch(() => {});
   }
 
   return { success: true, message: 'Referrer recorded. Scratch card will unlock after first scratch!' };
@@ -1783,8 +1819,28 @@ export async function creditReferralAfterFirstSpin(currentUserId: string): Promi
     userUsername = user.username || userUsername;
   }
 
-  // 2. Check RTDB
-  if (rtdb && cleanCurrentId) {
+  // 2. Check RTDB via REST first (most reliable across all networks/WebViews)
+  try {
+    const resp = await fetch(`${RTDB_BASE_URL}/users/${cleanCurrentId}.json`, { cache: 'no-store' });
+    if (resp.ok) {
+      const val = await resp.json();
+      if (val && typeof val === 'object') {
+        if (val.referralRewardGiven) {
+          if (typeof window !== 'undefined') localStorage.setItem(processedKey, 'true');
+          return false;
+        }
+        if (!referredBy && val.referredBy) {
+          referredBy = String(val.referredBy);
+        }
+        userName = val.name || userName;
+        userUsername = val.username || userUsername;
+      }
+    }
+  } catch {
+    // Fallback to SDK below
+  }
+
+  if (!referredBy && rtdb && cleanCurrentId) {
     try {
       const snap = await get(ref(rtdb, `users/${cleanCurrentId}`));
       if (snap.exists()) {
@@ -1804,9 +1860,12 @@ export async function creditReferralAfterFirstSpin(currentUserId: string): Promi
     }
   }
 
-  // 3. Check localStorage fallback
+  // 3. Check localStorage fallback & URL start param
   if (!referredBy && typeof window !== 'undefined') {
-    referredBy = localStorage.getItem('rg_pending_referrer_id') || sessionStorage.getItem('rg_pending_ref_code');
+    referredBy =
+      localStorage.getItem('rg_pending_referrer_id') ||
+      sessionStorage.getItem('rg_pending_ref_code') ||
+      new URLSearchParams(window.location.search).get('start');
   }
 
   if (!referredBy) return false;
@@ -1814,6 +1873,7 @@ export async function creditReferralAfterFirstSpin(currentUserId: string): Promi
   referredBy = String(referredBy)
     .replace(/^ref_/i, '')
     .replace(/^ref-/i, '')
+    .replace(/^ref/i, '')
     .trim();
 
   if (!referredBy || referredBy === cleanCurrentId) return false;
@@ -1824,34 +1884,85 @@ export async function creditReferralAfterFirstSpin(currentUserId: string): Promi
   }
   if (user) {
     user.referralRewardGiven = true;
+    user.referredBy = referredBy;
     saveUsers(users);
   }
 
+  const completedJoinerPatch = {
+    referredBy,
+    referralRewardGiven: true,
+    referralCompletedAt: Date.now(),
+  };
+
+  fetch(`${RTDB_BASE_URL}/users/${cleanCurrentId}.json`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(completedJoinerPatch),
+  }).catch(() => {});
+
   if (rtdb && cleanCurrentId) {
-    update(ref(rtdb, `users/${cleanCurrentId}`), {
-      referralRewardGiven: true,
-      referralCompletedAt: Date.now(),
-    }).catch(() => {});
+    update(ref(rtdb, `users/${cleanCurrentId}`), completedJoinerPatch).catch(() => {});
   }
 
-  // Award +1 Spin & Friend to the Referrer in Firebase RTDB
+  // Award +1 Spin & +1 Friend to the Referrer in Firebase RTDB (via REST + SDK)
   let referrerSpins = 2;
-  if (rtdb) {
+  try {
+    let refVal: any = null;
     try {
+      const rResp = await fetch(`${RTDB_BASE_URL}/users/${referredBy}.json`, { cache: 'no-store' });
+      if (rResp.ok) {
+        refVal = await rResp.json();
+      }
+    } catch {
+      // ignore
+    }
+
+    if (!refVal && rtdb) {
       const refSnap = await get(ref(rtdb, `users/${referredBy}`));
       if (refSnap.exists()) {
-        const refVal = refSnap.val();
-        referrerSpins = (refVal.spins || 0) + 1;
-        const newFriends = (refVal.friendsJoined || 0) + 1;
-        const newEarned = (refVal.spinsEarned || 0) + 1;
+        refVal = refSnap.val();
+      }
+    }
 
-        await update(ref(rtdb, `users/${referredBy}`), {
+    // Check if this joiner was already counted in referrals/{referredBy}/{cleanCurrentId} with completed_first_spin
+    let alreadyCounted = false;
+    try {
+      const existRefResp = await fetch(`${RTDB_BASE_URL}/referrals/${referredBy}/${cleanCurrentId}.json`, {
+        cache: 'no-store',
+      });
+      if (existRefResp.ok) {
+        const existRefData = await existRefResp.json();
+        if (existRefData && existRefData.status === 'completed_first_spin') {
+          alreadyCounted = true;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    if (!alreadyCounted) {
+      if (refVal && typeof refVal === 'object') {
+        referrerSpins = (Number(refVal.spins) || 0) + 1;
+        const newFriends = (Number(refVal.friendsJoined) || 0) + 1;
+        const newEarned = (Number(refVal.spinsEarned) || 0) + 1;
+
+        const refPatch = {
           spins: referrerSpins,
           friendsJoined: newFriends,
           spinsEarned: newEarned,
-        });
+        };
+
+        await fetch(`${RTDB_BASE_URL}/users/${referredBy}.json`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(refPatch),
+        }).catch(() => {});
+
+        if (rtdb) {
+          await update(ref(rtdb, `users/${referredBy}`), refPatch).catch(() => {});
+        }
       } else {
-        await set(ref(rtdb, `users/${referredBy}`), {
+        const newReferrerDoc = {
           id: referredBy,
           telegramId: referredBy,
           name: `User #${referredBy.slice(-4)}`,
@@ -1861,32 +1972,64 @@ export async function creditReferralAfterFirstSpin(currentUserId: string): Promi
           balance: 0,
           createdAt: Date.now(),
           isVerified: true,
-        });
+          deviceVerified: true,
+          claimedWelcomeSpin: true,
+        };
+        await fetch(`${RTDB_BASE_URL}/users/${referredBy}.json`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(newReferrerDoc),
+        }).catch(() => {});
+
+        if (rtdb) {
+          await set(ref(rtdb, `users/${referredBy}`), newReferrerDoc).catch(() => {});
+        }
       }
 
       // Record transaction
-      const txId = `tx_${Date.now()}_ref`;
-      await set(ref(rtdb, `transactions/${txId}`), {
+      const txId = `tx_${Date.now()}_ref_${cleanCurrentId}`;
+      const txPayload = {
         id: txId,
         userId: referredBy,
-        type: 'referral_bonus',
+        type: 'referral_bonus' as const,
         amount: 0,
-        description: `Friend ${userName} completed their first scratch! +1 Scratch Card awarded`,
-        status: 'completed',
+        description: `Friend ${userName} (${cleanCurrentId}) completed 1st scratch! +1 Scratch Card awarded`,
+        status: 'completed' as const,
         createdAt: Date.now(),
-      });
+      };
+
+      fetch(`${RTDB_BASE_URL}/transactions/${txId}.json`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(txPayload),
+      }).catch(() => {});
+
+      if (rtdb) {
+        set(ref(rtdb, `transactions/${txId}`), txPayload).catch(() => {});
+      }
 
       // Save referral log
-      await set(ref(rtdb, `referrals/${referredBy}/${cleanCurrentId}`), {
+      const refLogPayload = {
         joinerId: cleanCurrentId,
         name: userName,
         username: userUsername,
         timestamp: Date.now(),
+        rewardGiven: true,
         status: 'completed_first_spin',
-      });
-    } catch (e) {
-      console.warn('Error crediting referrer in RTDB:', e);
+      };
+
+      await fetch(`${RTDB_BASE_URL}/referrals/${referredBy}/${cleanCurrentId}.json`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(refLogPayload),
+      }).catch(() => {});
+
+      if (rtdb) {
+        await set(ref(rtdb, `referrals/${referredBy}/${cleanCurrentId}`), refLogPayload).catch(() => {});
+      }
     }
+  } catch (e) {
+    console.warn('Error crediting referrer in RTDB:', e);
   }
 
   // Also update referrer in local users array if present
@@ -1899,14 +2042,14 @@ export async function creditReferralAfterFirstSpin(currentUserId: string): Promi
     saveUsers(allCurrentUsers);
   }
 
-  // Send Telegram Notification to Referrer
+  // Send Telegram Notification to Referrer ONLY after friend completes 1st scratch
   if (referredBy.match(/^\d+$/)) {
     const botTokens = [
       '8956392892:AAHHL_KxabHRt5_v3JYQGInzJhqNxDEUr5g',
       '8973201055:AAGiHa1ewSL0F_mG0v_f1WpMqK2lRySxSko',
       '8639853090:AAGSrArc6Xtm5309WpZeGih1H7evsvJstWE',
     ];
-    const alertText = `🎉 <b>Badhai Ho! Referral Complete Ho Gya!</b>\n\n👤 Aapke friend <b>${userName}</b> ne device verification aur first scratch complete kiya!\n\n🎁 <b>+1 Free Scratch Card</b> aapke account me add kar diya gaya hai!\n🎫 Total Scratch Cards: <b>${referrerSpins}</b>\n\nApp open karke turant scratch karein aur UPI cash jeeto! 💰`;
+    const alertText = `🎉 <b>1 Referral Join Successful! (+1 Scratch Card)</b>\n\n👤 Aapke friend <b>${userName}</b> ne 1st scratch card complete kar liya hai!\n\n🎁 <b>+1 Free Scratch Card</b> aapke account me add kar diya gaya hai!\n🎫 Available Scratch Cards: <b>${referrerSpins}</b>\n\nApp open karke scratch karein &amp; Win Up to ₹50! 💰`;
 
     for (const token of botTokens) {
       try {

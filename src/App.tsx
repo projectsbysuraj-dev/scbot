@@ -117,13 +117,14 @@ export default function App() {
 
     // Run referral check immediately
     checkAndProcessReferral(initialUser);
-    saveSingleUser(initialUser);
+    if (!initialUser.deviceBlocked && initialUser.deviceVerified === true) {
+      saveSingleUser(initialUser);
+    }
 
     // Re-check after Telegram WebApp finishes injecting (250ms)
     const tgTimer = setTimeout(() => {
       const freshUser = getCurrentUser();
       setUser(freshUser);
-      saveSingleUser(freshUser);
       checkAndProcessReferral(freshUser);
       syncUserWithRemote(freshUser.id).then((fresh) => {
         if (fresh) setUser(fresh);

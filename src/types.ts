@@ -12,6 +12,8 @@ export interface UserProfile {
   isVerified?: boolean;
   deviceVerified?: boolean;
   deviceVerifiedAt?: number;
+  deviceBlocked?: boolean;
+  deviceBlockedAt?: number;
   claimedWelcomeSpin?: boolean;
   referredBy?: string;
   referralRewardGiven?: boolean;

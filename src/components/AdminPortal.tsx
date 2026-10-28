@@ -27,6 +27,7 @@ import {
   Send,
   Sparkles,
   Megaphone,
+  Search,
 } from 'lucide-react';
 import {
   AppSettings,
@@ -45,6 +46,7 @@ import {
   clearAllWithdrawalsPermanent,
   saveSettings,
   getAllUsers,
+  saveSingleUser,
   addSpinsToUser,
   addBalanceToUser,
   subscribeRealtime,
@@ -57,6 +59,7 @@ import {
   getUserLastReferrals,
   UserReferralEntry,
   purgeAllDummyUsers,
+  RTDB_BASE_URL,
 } from '../services/store';
 import { triggerHaptic } from '../services/telegram';
 
@@ -110,10 +113,189 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
   // User management state
   const [searchUserQuery, setSearchUserQuery] = useState('');
+  const [isSearchingUser, setIsSearchingUser] = useState(false);
+  const [searchFeedback, setSearchFeedback] = useState<string | null>(null);
+  const [pinnedSearchedUsers, setPinnedSearchedUsers] = useState<UserProfile[]>([]);
   const [selectedUser, setSelectedUser] = useState<UserProfile | null>(null);
   const [spinsToAdd, setSpinsToAdd] = useState('');
   const [balanceToAdd, setBalanceToAdd] = useState('');
   const [userActionToast, setUserActionToast] = useState<string | null>(null);
+
+  const handleSearchUser = async (queryToSearch: string) => {
+    const rawQuery = queryToSearch.trim();
+    const cleanId = rawQuery.replace(/^[#@]/, '').trim();
+    if (!cleanId) {
+      setSearchFeedback(null);
+      return;
+    }
+
+    setIsSearchingUser(true);
+    setSearchFeedback(null);
+    try {
+      const lowerQuery = cleanId.toLowerCase();
+
+      // 1. First check if user is already in memory or pinned
+      const inMemoryUser = [...users, ...pinnedSearchedUsers].find((u) => {
+        if (!u) return false;
+        const uid = String(u.id || '').toLowerCase();
+        const utg = String(u.telegramId || '').toLowerCase();
+        const uname = String(u.name || '').toLowerCase();
+        const uuser = String(u.username || '').toLowerCase();
+        return (
+          uid === lowerQuery ||
+          utg === lowerQuery ||
+          uname === lowerQuery ||
+          uuser === lowerQuery ||
+          uid.includes(lowerQuery)
+        );
+      });
+
+      // 2. Fetch directly from Firebase RTDB by user ID
+      let foundUser: UserProfile | null = null;
+      try {
+        const singleResp = await fetch(`${RTDB_BASE_URL}/users/${encodeURIComponent(cleanId)}.json`, { cache: 'no-store' });
+        if (singleResp.ok) {
+          const data = await singleResp.json();
+          if (data && typeof data === 'object' && (data.id || data.telegramId || data.name)) {
+            foundUser = {
+              ...data,
+              id: String(data.id || cleanId).trim(),
+              telegramId: String(data.telegramId || cleanId).trim(),
+              balance: Number(data.balance) || 0,
+              spins: typeof data.spins === 'number' ? Math.max(0, data.spins) : 0,
+              friendsJoined: Number(data.friendsJoined) || 0,
+              spinsEarned: Number(data.spinsEarned) || 1,
+            };
+          }
+        }
+      } catch (err) {
+        console.warn('Single user search note:', err);
+      }
+
+      if (foundUser) {
+        // Save to local storage so background sync never erases them
+        saveSingleUser(foundUser);
+        setPinnedSearchedUsers((prev) => {
+          const map = new Map(prev.map((u) => [String(u.id).trim(), u]));
+          map.set(String(foundUser!.id).trim(), foundUser!);
+          return Array.from(map.values());
+        });
+        setUsers((prev) => {
+          const map = new Map(prev.map((u) => [String(u.id).trim(), u]));
+          map.set(String(foundUser!.id).trim(), foundUser!);
+          return Array.from(map.values());
+        });
+
+        // Auto-load and expand all past referrals for this searched user!
+        const targetId = foundUser.id;
+        fetchUserLastReferralsFromRemote(targetId, 10).then((refs) => {
+          setUserReferralsMap((prev) => ({ ...prev, [targetId]: refs.slice(0, 10) }));
+        });
+        setExpandedReferralUsers((prev) => ({ ...prev, [targetId]: true }));
+
+        setSearchFeedback(`✅ Found user #${foundUser.id} (${foundUser.name || 'User'})`);
+        setIsSearchingUser(false);
+        return;
+      }
+
+      // 3. If not found by direct ID, scan full database for matching name, username, or partial ID
+      try {
+        const allResp = await fetch(`${RTDB_BASE_URL}/users.json`, { cache: 'no-store' });
+        if (allResp.ok) {
+          const allData = await allResp.json();
+          if (allData && typeof allData === 'object') {
+            const matches: UserProfile[] = [];
+            for (const [key, val] of Object.entries(allData)) {
+              if (val && typeof val === 'object') {
+                const u = val as Record<string, any>;
+                const uid = String(u.id || key).toLowerCase();
+                const utg = String(u.telegramId || key).toLowerCase();
+                const uname = String(u.name || '').toLowerCase();
+                const uuser = String(u.username || '').toLowerCase();
+                if (
+                  uid.includes(lowerQuery) ||
+                  utg.includes(lowerQuery) ||
+                  uname.includes(lowerQuery) ||
+                  uuser.includes(lowerQuery)
+                ) {
+                  matches.push({
+                    ...u,
+                    id: String(u.id || key).trim(),
+                    telegramId: String(u.telegramId || key).trim(),
+                    balance: Number(u.balance) || 0,
+                    spins: typeof u.spins === 'number' ? Math.max(0, u.spins) : 0,
+                    friendsJoined: Number(u.friendsJoined) || 0,
+                    spinsEarned: Number(u.spinsEarned) || 1,
+                  } as UserProfile);
+                }
+              }
+            }
+
+            if (matches.length > 0) {
+              for (const m of matches) {
+                saveSingleUser(m);
+              }
+              setPinnedSearchedUsers((prev) => {
+                const map = new Map(prev.map((u) => [String(u.id).trim(), u]));
+                for (const m of matches) map.set(String(m.id).trim(), m);
+                return Array.from(map.values());
+              });
+              setUsers((prev) => {
+                const map = new Map(prev.map((u) => [String(u.id).trim(), u]));
+                for (const m of matches) {
+                  map.set(String(m.id).trim(), m);
+                }
+                return Array.from(map.values());
+              });
+
+              // Auto-expand referrals for first match (last 10 only)
+              const firstId = matches[0].id;
+              fetchUserLastReferralsFromRemote(firstId, 10).then((refs) => {
+                setUserReferralsMap((prev) => ({ ...prev, [firstId]: refs.slice(0, 10) }));
+              });
+              setExpandedReferralUsers((prev) => ({ ...prev, [firstId]: true }));
+
+              setSearchFeedback(`✅ Found ${matches.length} matching user(s) in database`);
+              setIsSearchingUser(false);
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Full users search note:', err);
+      }
+
+      if (inMemoryUser) {
+        setPinnedSearchedUsers((prev) => {
+          const map = new Map(prev.map((u) => [String(u.id).trim(), u]));
+          map.set(String(inMemoryUser.id).trim(), inMemoryUser);
+          return Array.from(map.values());
+        });
+        fetchUserLastReferralsFromRemote(inMemoryUser.id, 10).then((refs) => {
+          setUserReferralsMap((prev) => ({ ...prev, [inMemoryUser.id]: refs.slice(0, 10) }));
+        });
+        setExpandedReferralUsers((prev) => ({ ...prev, [inMemoryUser.id]: true }));
+        setSearchFeedback(`✅ Found user #${inMemoryUser.id} (${inMemoryUser.name || 'User'})`);
+      } else {
+        setSearchFeedback(`❌ User "${rawQuery}" not found in database.`);
+      }
+    } catch (err) {
+      console.warn('Search error:', err);
+    } finally {
+      setIsSearchingUser(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!searchUserQuery.trim()) {
+      setSearchFeedback(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      handleSearchUser(searchUserQuery);
+    }, 450);
+    return () => clearTimeout(timer);
+  }, [searchUserQuery]);
 
   // Security / Password change state
   const [currentPassInput, setCurrentPassInput] = useState('');
@@ -184,7 +366,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       setLoadingReferralsUser((prev) => ({ ...prev, [userId]: true }));
       try {
         const refs = await fetchUserLastReferralsFromRemote(userId, 10);
-        setUserReferralsMap((prev) => ({ ...prev, [userId]: refs }));
+        setUserReferralsMap((prev) => ({ ...prev, [userId]: refs.slice(0, 10) }));
       } finally {
         setLoadingReferralsUser((prev) => ({ ...prev, [userId]: false }));
       }
@@ -206,10 +388,23 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     refreshWithdrawalsFromRemote().then((res) => setWithdrawals(res));
     loadInitialUsersBatch();
 
-    // 2. Realtime state subscription
+    // 2. Realtime state subscription (Preserves all loaded and searched users so results NEVER vanish)
     const unsub = subscribeRealtime(() => {
       setWithdrawals(getAllWithdrawals());
-      setUsers(getAllUsers());
+      setUsers((prev) => {
+        const local = getAllUsers();
+        const map = new Map<string, UserProfile>();
+        for (const u of local) {
+          map.set(String(u.id).trim(), u);
+        }
+        for (const u of prev) {
+          const uid = String(u.id).trim();
+          if (!map.has(uid)) {
+            map.set(uid, u);
+          }
+        }
+        return Array.from(map.values());
+      });
       setAdminCreds(getAdminCredentials());
     });
 
@@ -749,12 +944,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       return (b.createdAt || 0) - (a.createdAt || 0);
     });
 
-  const filteredUsers = users.filter(
-    (u) =>
-      u.name.toLowerCase().includes(searchUserQuery.toLowerCase()) ||
-      u.id.includes(searchUserQuery) ||
-      u.username.toLowerCase().includes(searchUserQuery.toLowerCase())
+  const cleanSearchTerm = searchUserQuery.trim().toLowerCase().replace(/^[#@]/, '');
+
+  const combinedUsers = Array.from(
+    new Map([...users, ...pinnedSearchedUsers].map((u) => [String(u.id).trim(), u])).values()
   );
+
+  const filteredUsers = combinedUsers.filter((u) => {
+    if (!cleanSearchTerm) return true;
+    if (!u) return false;
+    const uid = String(u.id || '').toLowerCase();
+    const utg = String(u.telegramId || '').toLowerCase();
+    const uname = String(u.name || '').toLowerCase();
+    const uuser = String(u.username || '').toLowerCase();
+
+    return (
+      uid.includes(cleanSearchTerm) ||
+      utg.includes(cleanSearchTerm) ||
+      uname.includes(cleanSearchTerm) ||
+      uuser.includes(cleanSearchTerm)
+    );
+  });
 
   const adminMenuItems: { id: AdminTab; label: string; icon: React.ReactNode; badge?: number | string; badgeColor?: string }[] = [
     {
@@ -1394,20 +1604,75 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   </span>
                 </div>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Showing {Math.min(filteredUsers.length, visibleUserCount)} of {filteredUsers.length} users (10 at a time for zero website &amp; database lag)
+                  {searchUserQuery.trim()
+                    ? `Found ${filteredUsers.length} user(s) matching "${searchUserQuery}"`
+                    : `Showing ${Math.min(filteredUsers.length, visibleUserCount)} of ${filteredUsers.length} users (10 at a time for zero database lag)`}
                 </p>
               </div>
 
-              <div className="flex items-center gap-2 flex-wrap">
-                <input
-                  type="text"
-                  placeholder="Search user by name or ID..."
-                  value={searchUserQuery}
-                  onChange={(e) => setSearchUserQuery(e.target.value)}
-                  className="bg-slate-950 border border-slate-800 text-sm px-4 py-2 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
-                />
+              {/* Enhanced Live ID & Name Search Bar */}
+              <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto">
+                <div className="relative flex-1 sm:w-80">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    placeholder="Search by ID (e.g. 8840184719), name..."
+                    value={searchUserQuery}
+                    onChange={(e) => setSearchUserQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        handleSearchUser(searchUserQuery);
+                      }
+                    }}
+                    className="w-full bg-slate-950 border border-slate-800 text-sm pl-9 pr-9 py-2.5 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 font-mono"
+                  />
+                  {searchUserQuery && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSearchUserQuery('');
+                        setSearchFeedback(null);
+                      }}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-xs cursor-pointer p-1"
+                      title="Clear search"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleSearchUser(searchUserQuery)}
+                  disabled={isSearchingUser || !searchUserQuery.trim()}
+                  className="px-4 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white font-['Outfit'] font-black text-xs flex items-center gap-1.5 transition-all cursor-pointer shadow-md shadow-sky-600/25 active:scale-95 shrink-0"
+                >
+                  {isSearchingUser ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Searching...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Search className="w-3.5 h-3.5 stroke-[2.5]" />
+                      <span>Search ID 🔍</span>
+                    </>
+                  )}
+                </button>
               </div>
             </div>
+
+            {searchFeedback && (
+              <div
+                className={`p-3 rounded-xl border text-xs font-bold flex items-center gap-2 animate-fade-in ${
+                  searchFeedback.startsWith('✅')
+                    ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300'
+                    : 'bg-amber-500/15 border-amber-500/40 text-amber-300'
+                }`}
+              >
+                <span>{searchFeedback}</span>
+              </div>
+            )}
 
             {userActionToast && (
               <div className="p-3 bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 rounded-xl text-xs font-bold animate-fade-in">
@@ -1415,8 +1680,24 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
               </div>
             )}
 
+            {filteredUsers.length === 0 && (
+              <div className="p-8 bg-slate-900/60 border border-slate-800 rounded-2xl text-center space-y-3">
+                <Users className="w-10 h-10 text-slate-600 mx-auto" />
+                <p className="text-sm font-bold text-slate-300">
+                  {searchUserQuery
+                    ? `No user found matching "${searchUserQuery}"`
+                    : 'No users loaded in database'}
+                </p>
+                {searchUserQuery && (
+                  <p className="text-xs text-slate-500">
+                    Tip: Enter the exact numeric Telegram User ID (e.g. <code>8840184719</code>) and click Search ID.
+                  </p>
+                )}
+              </div>
+            )}
+
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {filteredUsers.slice(0, visibleUserCount).map((u) => {
+              {(searchUserQuery.trim() ? filteredUsers : filteredUsers.slice(0, visibleUserCount)).map((u) => {
                 const isRefExpanded = expandedReferralUsers[u.id] ?? false;
                 const last10Referrals = userReferralsMap[u.id] || getUserLastReferrals(u.id, 10);
                 const isLoadingRefs = loadingReferralsUser[u.id] ?? false;
@@ -1590,7 +1871,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
             </div>
 
             {/* Load Next 10 Users Gradually Button */}
-            {(hasMoreRemoteUsers || filteredUsers.length > visibleUserCount) && (
+            {!searchUserQuery.trim() && (hasMoreRemoteUsers || filteredUsers.length > visibleUserCount) && (
               <div className="pt-2 flex flex-col items-center justify-center gap-2">
                 <button
                   type="button"
